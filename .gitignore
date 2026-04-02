@@ -1,1 +1,3 @@
 /target
+*_report.json
+test_100k.fastq
