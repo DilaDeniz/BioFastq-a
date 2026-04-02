@@ -635,13 +635,16 @@ fn render_log_panel(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, sna
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 2 {
-        eprintln!("Usage: biofastq-a <input.fastq|input.fasta>");
+    let headless = args.iter().any(|a| a == "--headless");
+    let file_args: Vec<&String> = args.iter().skip(1).filter(|a| *a != "--headless").collect();
+
+    if file_args.is_empty() {
+        eprintln!("Usage: biofastq-a <input.fastq|input.fasta> [--headless]");
         eprintln!("  Analyzes FASTQ/FASTA files with real-time TUI dashboard.");
         std::process::exit(1);
     }
 
-    let input_path = &args[1];
+    let input_path = file_args[0];
 
     // Validate file exists
     let metadata = match fs::metadata(input_path) {
@@ -675,41 +678,46 @@ fn main() {
         process_file(path_clone, state_clone);
     });
 
-    // Set up TUI
-    let mut terminal = match setup_terminal() {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("Error: Failed to initialize terminal: {}", e);
-            std::process::exit(1);
-        }
-    };
-
-    let tick_rate = Duration::from_millis(80);
-
-    // Main UI loop
-    loop {
-        // Clone state snapshot for rendering
-        let snap = {
-            let s = state.lock().unwrap();
-            s.clone()
+    if headless {
+        // Headless mode: just wait for processing to finish
+        let _ = processing_handle.join();
+    } else {
+        // Set up TUI
+        let mut terminal = match setup_terminal() {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: Failed to initialize terminal: {}", e);
+                std::process::exit(1);
+            }
         };
 
-        let _ = terminal.draw(|f| ui(f, &snap));
+        let tick_rate = Duration::from_millis(80);
 
-        if crossterm::event::poll(tick_rate).unwrap_or(false) {
-            if let Ok(Event::Key(key)) = event::read() {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                    break;
+        // Main UI loop
+        loop {
+            // Clone state snapshot for rendering
+            let snap = {
+                let s = state.lock().unwrap();
+                s.clone()
+            };
+
+            let _ = terminal.draw(|f| ui(f, &snap));
+
+            if crossterm::event::poll(tick_rate).unwrap_or(false) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                        break;
+                    }
                 }
             }
         }
+
+        // Restore terminal
+        restore_terminal(&mut terminal);
+
+        // Wait for processing thread to finish
+        let _ = processing_handle.join();
     }
-
-    // Restore terminal
-    restore_terminal(&mut terminal);
-
-    // Wait for processing thread to finish (with short timeout)
-    let _ = processing_handle.join();
 
     // Export report if completed
     let snap = state.lock().unwrap();
