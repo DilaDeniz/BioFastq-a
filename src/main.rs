@@ -37,6 +37,7 @@ OPTIONS:
   --trim              Trim adapter sequences and write cleaned reads to
                       <stem>_trimmed.fastq.gz alongside the reports
   --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
+  --version, -V       Print version and exit
   --help, -h          Show this help message
 
 OUTPUT:
@@ -66,6 +67,11 @@ fn parse_args() -> Result<CliConfig, String> {
 
     if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
+        std::process::exit(0);
+    }
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("biofastq-a {}", env!("CARGO_PKG_VERSION"));
         std::process::exit(0);
     }
 
@@ -271,7 +277,14 @@ fn main() {
                 Err(e) => eprintln!("Warning: JSON report failed: {}", e),
             }
 
-            println!("\nProcessing time: {:.1}s", snap.elapsed_secs());
+            let elapsed = snap.elapsed_secs();
+            let total_reads: u64 = snap.all_files().iter().map(|f| f.read_count).sum();
+            let total_bytes: u64 = snap.all_files().iter().map(|f| f.file_size).sum();
+            let reads_per_sec = if elapsed > 0.0 { total_reads as f64 / elapsed } else { 0.0 };
+            let mb_per_sec = if elapsed > 0.0 { total_bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
+
+            println!("Processing time:  {:.1}s", elapsed);
+            println!("Throughput:       {:.0} reads/s  |  {:.0} MB/s", reads_per_sec, mb_per_sec);
         }
         ProcessingStatus::Error(e) => {
             eprintln!("\nAnalysis failed: {}", e);
