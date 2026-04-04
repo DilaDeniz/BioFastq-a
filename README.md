@@ -240,6 +240,17 @@ process BIOFASTQA {
 
 ---
 
+## Sponsor with Crypto
+
+If you find this project useful, consider sending a small tip. Due to age restrictions I'm unable to use traditional payment platforms, so crypto is the only way I can receive support — thank you!
+
+| Network | Address |
+|---|---|
+| **Solana (SOL)** | `AY5SwVxbvTHL16SUGj6kJBqMk4USniZmbqdXxH8xVrTa` |
+| **Ethereum (ETH)** | `0x5176d005DD096aFa145B3ffff308b72ed76f1554` |
+
+---
+
 ## License
 
 MIT
