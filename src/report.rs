@@ -393,12 +393,78 @@ function drawTile(id, data) {
   ctx.fillText('Tile ID', p.l+pw/2, H-2);
 }
 
+/* ---------- Base composition chart ---------- */
+function drawBaseComp(id, data) {
+  // data: array of [A%, C%, G%, T%, N%] per position
+  var cv=document.getElementById(id); if(!cv)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var p={l:52,r:16,t:20,b:36};
+  var pw=W-p.l-p.r, ph=H-p.t-p.b;
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
+  var colors=['#58a6ff','#3fb950','#f78166','#d29922','#8b949e']; // A,C,G,T,N
+  var labels=['A','C','G','T','N'];
+  var n=data.length, bw=pw/n;
+  // grid
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
+  for(var g=0;g<=4;g++){var y=p.t+ph*(1-g/4);ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
+  // draw lines
+  labels.forEach(function(lbl,li){
+    ctx.strokeStyle=colors[li]; ctx.lineWidth=1.5; ctx.beginPath();
+    data.forEach(function(pt,xi){
+      var x=p.l+(xi+0.5)*bw, y=p.t+ph*(1-pt[li]/100);
+      if(xi===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  });
+  // axes
+  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
+  for(var g=0;g<=4;g++){ctx.fillText((g*25)+'%',2,p.t+ph*(1-g/4)+4);}
+  ctx.fillText('1',p.l,H-p.b+14);
+  ctx.fillText(n,p.l+pw-20,H-p.b+14);
+  // legend
+  var lx=p.l+4;
+  labels.forEach(function(lbl,li){
+    ctx.fillStyle=colors[li]; ctx.fillRect(lx,p.t+2,10,10);
+    ctx.fillStyle='#c9d1d9'; ctx.fillText(lbl,lx+13,p.t+11); lx+=32;
+  });
+}
+
+/* ---------- Quality distribution chart ---------- */
+function drawQualDist(id, data) {
+  // data: array of 43 counts indexed by mean Phred score
+  var cv=document.getElementById(id); if(!cv)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var p={l:52,r:16,t:20,b:36};
+  var pw=W-p.l-p.r, ph=H-p.t-p.b;
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
+  var max=Math.max.apply(null,data)||1;
+  var n=data.length, bw=pw/n;
+  data.forEach(function(cnt,q){
+    var pct=cnt/max;
+    var r=q<20?200:q<30?210:80, g=q<20?80:q<30?160:200, b=q<20?80:q<30?80:100;
+    ctx.fillStyle='rgba('+r+','+g+','+b+',0.85)';
+    var barH=ph*pct;
+    ctx.fillRect(p.l+q*bw, p.t+ph-barH, bw-1, barH);
+  });
+  // grid lines
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
+  for(var g=0;g<=4;g++){var y=p.t+ph*g/4;ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
+  // labels
+  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
+  [0,10,20,30,40].forEach(function(q){ctx.fillText('Q'+q,p.l+q*bw-8,H-p.b+14);});
+  ctx.fillText('Mean Phred per read',p.l+pw/2-60,H-2);
+}
+
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
     drawQual('qual-'+i, f.qual);
     drawLen('len-'+i, f.len);
     drawKmer('kmer-'+i, f.kmers);
+    drawBaseComp('basecomp-'+i, f.basecomp);
+    drawQualDist('qualdist-'+i, f.qualdist);
     if (f.tiles && f.tiles.length) drawTile('tile-'+i, f.tiles);
   });
 });
@@ -669,7 +735,30 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
         s.push_str("</div>\n");
     }
 
-    s.push_str("</div>\n"); // charts-row
+    s.push_str("</div>\n"); // charts-row (row 3)
+
+    // Row 4: Base composition + Quality distribution
+    s.push_str("<div class=\"charts-row\">\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Per-Base Sequence Content</h3>\n");
+    s.push_str(&format!(
+        "<canvas id=\"basecomp-{}\" width=\"600\" height=\"280\"></canvas>\n",
+        idx
+    ));
+    s.push_str("<p class=\"chart-note\">Base composition (A/C/G/T/N) per read position. Uniform lines indicate balanced sequence.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Per-Read Quality Distribution</h3>\n");
+    s.push_str(&format!(
+        "<canvas id=\"qualdist-{}\" width=\"600\" height=\"280\"></canvas>\n",
+        idx
+    ));
+    s.push_str("<p class=\"chart-note\">Distribution of mean Phred quality scores across all reads. Red=poor, orange=acceptable, green=good.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("</div>\n"); // charts-row (row 4)
 
     // Trim output info (only shown when trimming was active)
     if f.trim_output_path.is_some() || f.trimmed_reads > 0 {
@@ -760,12 +849,22 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         .into_iter()
         .map(|(t, q)| serde_json::json!([t, q]))
         .collect();
+    // Per-base composition: [[A%, C%, G%, T%, N%], ...]
+    let basecomp_json: Vec<serde_json::Value> = f
+        .base_composition_pct()
+        .into_iter()
+        .map(|pct| serde_json::json!(pct))
+        .collect();
+    // Quality distribution: [count_at_Q0, count_at_Q1, ..., count_at_Q42]
+    let qualdist_json: Vec<u64> = f.quality_distribution.clone();
 
     serde_json::json!({
         "qual": qual_per_pos,
         "len": len_dist,
         "kmers": kmer_json,
         "tiles": tile_json,
+        "basecomp": basecomp_json,
+        "qualdist": qualdist_json,
     })
 }
 

@@ -150,6 +150,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::new();
     let mut batch_seqs: Vec<Vec<u8>> = Vec::with_capacity(BATCH_SIZE);
+    let mut base_composition: Vec<[u64; 5]> = vec![[0u64; 5]; MAX_QUAL_POSITION];
+    let mut quality_distribution: Vec<u64> = vec![0u64; 43];
     // Duplication estimation
     let mut dup_seen: HashSet<u64> = HashSet::with_capacity(DUP_SAMPLE_SIZE);
     let mut dup_sampled: u64 = 0;
@@ -178,6 +180,19 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
         read_count += 1;
 
+        // --- Per-base composition ---
+        for (pos, &base) in seq.iter().enumerate() {
+            if pos >= MAX_QUAL_POSITION { break; }
+            let idx = match base {
+                b'A' | b'a' => 0,
+                b'C' | b'c' => 1,
+                b'G' | b'g' => 2,
+                b'T' | b't' => 3,
+                _ => 4, // N or other
+            };
+            base_composition[pos][idx] += 1;
+        }
+
         // --- Duplication fingerprint (first DUP_SAMPLE_SIZE reads) ---
         if dup_sampled < DUP_SAMPLE_SIZE as u64 {
             let h = fingerprint(&seq);
@@ -196,8 +211,36 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             }
         }
 
+        // --- Quality trimming (3' end) ---
+        let seq_after_qtrim: std::borrow::Cow<[u8]>;
+        let qual_after_qtrim: Option<std::borrow::Cow<[u8]>>;
+        if config.quality_trim_threshold > 0 {
+            if let Some(q) = qual {
+                let cut = quality_trim_pos(q, config.quality_trim_threshold);
+                seq_after_qtrim = std::borrow::Cow::Owned(seq[..cut].to_vec());
+                qual_after_qtrim = Some(std::borrow::Cow::Owned(q[..cut].to_vec()));
+            } else {
+                seq_after_qtrim = std::borrow::Cow::Borrowed(&seq);
+                qual_after_qtrim = qual.map(std::borrow::Cow::Borrowed);
+            }
+        } else {
+            seq_after_qtrim = std::borrow::Cow::Borrowed(&seq);
+            qual_after_qtrim = qual.map(std::borrow::Cow::Borrowed);
+        }
+        let seq = seq_after_qtrim.as_ref();
+        let qual = qual_after_qtrim.as_deref();
+
+        // --- Quality score distribution ---
+        if let Some(q) = qual {
+            if !q.is_empty() {
+                let mean_phred = q.iter().map(|&b| b.saturating_sub(33) as f64).sum::<f64>() / q.len() as f64;
+                let bucket = (mean_phred as usize).min(42);
+                quality_distribution[bucket] += 1;
+            }
+        }
+
         // --- Adapter detection & trimming ---
-        let trim_pos = find_adapter_pos(&seq);
+        let trim_pos = find_adapter_pos_with_custom(seq, &config.custom_adapters);
 
         if let Some(pos) = trim_pos {
             adapter_hits += 1;
@@ -394,6 +437,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             cur.kmer_counts = kmer_total;
             cur.dup_rate_pct = dup_rate;
             cur.per_tile_quality = per_tile;
+            cur.base_composition = base_composition;
+            cur.quality_distribution = quality_distribution;
         }
 
         let trim_note = if config.trim_output {
@@ -505,15 +550,36 @@ fn fingerprint(seq: &[u8]) -> u64 {
 }
 
 /// Find the leftmost position where a known adapter begins.
+#[allow(dead_code)]
 pub fn find_adapter_pos(seq: &[u8]) -> Option<usize> {
-    ADAPTERS
-        .iter()
-        .filter_map(|(_, adapter)| {
-            let n = adapter.len().min(ADAPTER_MATCH_LEN);
-            let needle = &adapter[..n];
-            seq.windows(n).position(|w| w == needle)
-        })
-        .min()
+    find_adapter_pos_with_custom(seq, &[])
+}
+
+/// Find leftmost adapter position, including custom adapters.
+pub fn find_adapter_pos_with_custom(seq: &[u8], custom: &[Vec<u8>]) -> Option<usize> {
+    let builtin = ADAPTERS.iter().filter_map(|(_, adapter)| {
+        let n = adapter.len().min(ADAPTER_MATCH_LEN);
+        let needle = &adapter[..n];
+        seq.windows(n).position(|w| w == needle)
+    });
+    let custom_hits = custom.iter().filter_map(|adapter| {
+        let n = adapter.len().min(ADAPTER_MATCH_LEN);
+        if n == 0 { return None; }
+        let needle = &adapter[..n];
+        seq.windows(n).position(|w| w == needle)
+    });
+    builtin.chain(custom_hits).min()
+}
+
+/// Quality-trim 3' end: find rightmost position where sliding window mean >= threshold.
+/// Returns the cut position (keep seq[..cut]).
+pub fn quality_trim_pos(qual: &[u8], threshold: u8) -> usize {
+    // Simple per-base 3' trim: drop trailing bases below threshold
+    let mut cut = qual.len();
+    while cut > 0 && qual[cut - 1].saturating_sub(33) < threshold {
+        cut -= 1;
+    }
+    cut
 }
 
 /// Parse Illumina tile ID from a FASTQ header.

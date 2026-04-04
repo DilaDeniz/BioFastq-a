@@ -51,6 +51,10 @@ pub struct ProcessConfig {
     pub min_length: u64,
     /// Directory for trimmed output files
     pub output_dir: String,
+    /// Additional custom adapter sequences to screen/trim (on top of built-ins)
+    pub custom_adapters: Vec<Vec<u8>>,
+    /// If > 0, quality-trim the 3' end: drop trailing bases with Phred < threshold
+    pub quality_trim_threshold: u8,
 }
 
 impl Default for ProcessConfig {
@@ -59,6 +63,8 @@ impl Default for ProcessConfig {
             trim_output: false,
             min_length: 20,
             output_dir: ".".to_string(),
+            custom_adapters: Vec::new(),
+            quality_trim_threshold: 0,
         }
     }
 }
@@ -100,6 +106,12 @@ pub struct FileStats {
     pub dup_rate_pct: f64,
     // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
     pub per_tile_quality: HashMap<u32, (u64, u64)>,
+    // Per-base composition: [A, C, G, T, N] counts per position
+    pub base_composition: Vec<[u64; 5]>,
+    // Quality score distribution: count of reads per mean Phred score (index = floor(phred))
+    pub quality_distribution: Vec<u64>,
+    // N content per position: count of N bases per position
+    // (derived from base_composition but stored for convenience)
 }
 
 impl FileStats {
@@ -126,6 +138,8 @@ impl FileStats {
             trim_output_path: None,
             dup_rate_pct: 0.0,
             per_tile_quality: HashMap::new(),
+            base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
+            quality_distribution: vec![0u64; 43],
         }
     }
 
@@ -261,6 +275,44 @@ impl FileStats {
             .collect();
         v.sort_by_key(|(tile, _)| *tile);
         v
+    }
+
+    /// Per-base composition trimmed to last position with data.
+    /// Returns vec of (A%, C%, G%, T%, N%) per position.
+    pub fn base_composition_pct(&self) -> Vec<[f64; 5]> {
+        let last = self
+            .base_composition
+            .iter()
+            .rposition(|counts| counts.iter().any(|&c| c > 0))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        self.base_composition[..last]
+            .iter()
+            .map(|counts| {
+                let total: u64 = counts.iter().sum();
+                if total == 0 {
+                    [0.0; 5]
+                } else {
+                    let t = total as f64;
+                    [
+                        counts[0] as f64 / t * 100.0,
+                        counts[1] as f64 / t * 100.0,
+                        counts[2] as f64 / t * 100.0,
+                        counts[3] as f64 / t * 100.0,
+                        counts[4] as f64 / t * 100.0,
+                    ]
+                }
+            })
+            .collect()
+    }
+
+    /// N content per position as percentage.
+    #[allow(dead_code)]
+    pub fn n_content_per_position(&self) -> Vec<f64> {
+        self.base_composition_pct()
+            .iter()
+            .map(|pct| pct[4])
+            .collect()
     }
 
     /// Top N k-mers by frequency.

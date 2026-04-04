@@ -37,6 +37,8 @@ OPTIONS:
   --trim              Trim adapter sequences and write cleaned reads to
                       <stem>_trimmed.fastq.gz alongside the reports
   --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
+  --adapter <seq>     Additional adapter sequence to screen/trim (repeatable)
+  --quality-trim <Q>  Trim 3' bases with Phred quality below Q (default: off)
   --version, -V       Print version and exit
   --help, -h          Show this help message
 
@@ -60,6 +62,8 @@ struct CliConfig {
     output_dir: String,
     trim: bool,
     min_length: u64,
+    custom_adapters: Vec<Vec<u8>>,
+    quality_trim: u8,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -80,6 +84,8 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut output_dir = ".".to_string();
     let mut trim = false;
     let mut min_length: u64 = 20;
+    let mut custom_adapters: Vec<Vec<u8>> = Vec::new();
+    let mut quality_trim: u8 = 0;
     let mut i = 0;
 
     while i < args.len() {
@@ -102,6 +108,22 @@ fn parse_args() -> Result<CliConfig, String> {
                     .parse()
                     .map_err(|_| format!("--min-length must be an integer, got '{}'", args[i]))?;
             }
+            "--adapter" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--adapter requires a sequence value".into());
+                }
+                custom_adapters.push(args[i].to_uppercase().into_bytes());
+            }
+            "--quality-trim" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--quality-trim requires a Phred value".into());
+                }
+                quality_trim = args[i]
+                    .parse()
+                    .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("Unknown option: {}  (use --help for usage)", arg));
             }
@@ -120,6 +142,8 @@ fn parse_args() -> Result<CliConfig, String> {
         output_dir,
         trim,
         min_length,
+        custom_adapters,
+        quality_trim,
     })
 }
 
@@ -164,6 +188,8 @@ fn main() {
         trim_output: cfg.trim,
         min_length: cfg.min_length,
         output_dir: cfg.output_dir.clone(),
+        custom_adapters: cfg.custom_adapters.clone(),
+        quality_trim_threshold: cfg.quality_trim,
     };
 
     let n_files = cfg.input_files.len();
