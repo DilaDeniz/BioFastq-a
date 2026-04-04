@@ -299,10 +299,24 @@ fn render_metrics_panel(
 
     let (n50, n90) = stats.compute_n50_n90();
 
+    let tile_str = if !stats.per_tile_quality.is_empty() {
+        format!("{} tiles", stats.per_tile_quality.len())
+    } else {
+        "no Illumina hdr".to_string()
+    };
+
+    let trim_str = if stats.trim_output_path.is_some() {
+        format!("{:.1}% trimmed", stats.trimmed_pct())
+    } else {
+        "off".to_string()
+    };
+
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
         .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -317,60 +331,22 @@ fn render_metrics_panel(
         .split(area);
 
     let rows: &[(&str, String, Color)] = &[
-        (
-            "Read Count    ",
-            format_number(stats.read_count),
-            Color::LightGreen,
-        ),
-        (
-            "Total Bases   ",
-            format_bases(stats.total_bases),
-            Color::LightGreen,
-        ),
-        (
-            "Avg Length    ",
-            format!("{:.1} bp", stats.avg_length()),
-            Color::LightGreen,
-        ),
+        ("Read Count    ", format_number(stats.read_count), Color::LightGreen),
+        ("Total Bases   ", format_bases(stats.total_bases), Color::LightGreen),
+        ("Avg Length    ", format!("{:.1} bp", stats.avg_length()), Color::LightGreen),
         (
             "Min/Max Length",
-            format!(
-                "{} / {} bp",
-                stats.effective_min_length(),
-                stats.max_length
-            ),
+            format!("{} / {} bp", stats.effective_min_length(), stats.max_length),
             Color::Cyan,
         ),
-        (
-            "N50           ",
-            format!("{} bp", n50),
-            Color::Cyan,
-        ),
-        (
-            "N90           ",
-            format!("{} bp", n90),
-            Color::Cyan,
-        ),
-        (
-            "GC Content    ",
-            format!("{:.2}%", stats.gc_content()),
-            Color::LightGreen,
-        ),
-        (
-            "Avg Quality   ",
-            format!("Q{:.1}", stats.avg_quality()),
-            quality_color(stats.avg_quality()),
-        ),
-        (
-            "Q20 / Q30     ",
-            format!("{:.1}% / {:.1}%", stats.q20_pct(), stats.q30_pct()),
-            Color::LightGreen,
-        ),
-        (
-            "Adapter Contam",
-            format!("{:.2}%", stats.adapter_pct()),
-            adapter_color(stats.adapter_pct()),
-        ),
+        ("N50           ", format!("{} bp", n50), Color::Cyan),
+        ("N90           ", format!("{} bp", n90), Color::Cyan),
+        ("GC Content    ", format!("{:.2}%", stats.gc_content()), Color::LightGreen),
+        ("Avg Quality   ", format!("Q{:.1}", stats.avg_quality()), quality_color(stats.avg_quality())),
+        ("Q20 / Q30     ", format!("{:.1}% / {:.1}%", stats.q20_pct(), stats.q30_pct()), Color::LightGreen),
+        ("Adapter Contam", format!("{:.2}%", stats.adapter_pct()), adapter_color(stats.adapter_pct())),
+        ("Dup (est)     ", format!("{:.1}%", stats.dup_rate_pct), dup_color(stats.dup_rate_pct)),
+        ("Trim / Tiles  ", format!("{} / {}", trim_str, tile_str), Color::DarkGray),
     ];
 
     for (i, (label, value, color)) in rows.iter().enumerate() {
@@ -378,15 +354,10 @@ fn render_metrics_panel(
             break;
         }
         let line = Line::from(vec![
-            Span::styled(
-                format!("  {} ", label),
-                Style::default().fg(Color::White),
-            ),
+            Span::styled(format!("  {} ", label), Style::default().fg(Color::White)),
             Span::styled(
                 value.clone(),
-                Style::default()
-                    .fg(*color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(*color).add_modifier(Modifier::BOLD),
             ),
         ]);
         frame.render_widget(Paragraph::new(line), inner[i]);
@@ -394,23 +365,15 @@ fn render_metrics_panel(
 }
 
 fn quality_color(q: f64) -> Color {
-    if q >= 30.0 {
-        Color::LightGreen
-    } else if q >= 20.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    if q >= 30.0 { Color::LightGreen } else if q >= 20.0 { Color::Yellow } else { Color::Red }
 }
 
 fn adapter_color(pct: f64) -> Color {
-    if pct < 1.0 {
-        Color::LightGreen
-    } else if pct < 10.0 {
-        Color::Yellow
-    } else {
-        Color::Red
-    }
+    if pct < 1.0 { Color::LightGreen } else if pct < 10.0 { Color::Yellow } else { Color::Red }
+}
+
+fn dup_color(pct: f64) -> Color {
+    if pct < 5.0 { Color::LightGreen } else if pct < 20.0 { Color::Yellow } else { Color::Red }
 }
 
 // ---------------------------------------------------------------------------

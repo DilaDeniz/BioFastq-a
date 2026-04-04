@@ -42,6 +42,30 @@ pub struct LogEntry {
     pub message: String,
 }
 
+/// Configuration passed to the processing engine.
+#[derive(Clone)]
+pub struct ProcessConfig {
+    /// If set, write adapter-trimmed reads to this path (.fastq or .fastq.gz)
+    pub trim_output: bool,
+    /// Discard trimmed reads shorter than this (bp)
+    pub min_length: u64,
+    /// Directory for trimmed output files
+    pub output_dir: String,
+}
+
+impl Default for ProcessConfig {
+    fn default() -> Self {
+        Self {
+            trim_output: false,
+            min_length: 20,
+            output_dir: ".".to_string(),
+        }
+    }
+}
+
+/// How many reads to sample for duplication estimation
+pub const DUP_SAMPLE_SIZE: usize = 200_000;
+
 /// Per-file statistics accumulated during analysis
 #[derive(Clone)]
 pub struct FileStats {
@@ -68,6 +92,14 @@ pub struct FileStats {
     pub quality_by_position: Vec<(u64, u64)>,
     // Adapter contamination
     pub adapter_hits: u64,
+    // Trimming stats (filled when --trim is active)
+    pub trimmed_reads: u64,
+    pub trimmed_bases_removed: u64,
+    pub trim_output_path: Option<String>,
+    // Duplication estimate (sampled from first DUP_SAMPLE_SIZE reads)
+    pub dup_rate_pct: f64,
+    // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
+    pub per_tile_quality: HashMap<u32, (u64, u64)>,
 }
 
 impl FileStats {
@@ -89,6 +121,11 @@ impl FileStats {
             length_histogram: HashMap::new(),
             quality_by_position: vec![(0, 0); MAX_QUAL_POSITION],
             adapter_hits: 0,
+            trimmed_reads: 0,
+            trimmed_bases_removed: 0,
+            trim_output_path: None,
+            dup_rate_pct: 0.0,
+            per_tile_quality: HashMap::new(),
         }
     }
 
@@ -202,6 +239,27 @@ impl FileStats {
             .map(|(&l, &c)| (l, c))
             .collect();
         v.sort_by_key(|(l, _)| *l);
+        v
+    }
+
+    pub fn trimmed_pct(&self) -> f64 {
+        if self.read_count == 0 {
+            return 0.0;
+        }
+        self.trimmed_reads as f64 / self.read_count as f64 * 100.0
+    }
+
+    /// Per-tile quality sorted by tile ID ascending.
+    /// Returns vec of (tile_id, avg_phred).
+    pub fn sorted_tile_quality(&self) -> Vec<(u32, f64)> {
+        let mut v: Vec<(u32, f64)> = self
+            .per_tile_quality
+            .iter()
+            .map(|(&tile, &(sum, cnt))| {
+                (tile, if cnt == 0 { 0.0 } else { sum as f64 / cnt as f64 })
+            })
+            .collect();
+        v.sort_by_key(|(tile, _)| *tile);
         v
     }
 
