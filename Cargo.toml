@@ -1,6 +1,6 @@
 [package]
 name = "biofastq-a"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 description = "BioFastq-A - High-performance FASTQ/FASTA quality analysis with HTML reports"
 
@@ -12,7 +12,10 @@ crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
+flate2 = "1"          # gzip writer for trimmed output
 
 [profile.release]
 opt-level = 3
 lto = true
+codegen-units = 1
+strip = true

@@ -36,6 +36,10 @@ pub struct JsonFileReport {
     pub q20_reads_percent: f64,
     pub q30_reads_percent: f64,
     pub adapter_contamination_percent: f64,
+    pub duplication_rate_estimate_percent: f64,
+    pub trimmed_reads: u64,
+    pub trimmed_reads_percent: f64,
+    pub trim_output_path: Option<String>,
     pub top_kmers: Vec<(String, u64)>,
 }
 
@@ -65,6 +69,10 @@ pub fn export_json(state: &SharedState, output_dir: &str) -> io::Result<String> 
                 q20_reads_percent: f.q20_pct(),
                 q30_reads_percent: f.q30_pct(),
                 adapter_contamination_percent: f.adapter_pct(),
+                duplication_rate_estimate_percent: f.dup_rate_pct,
+                trimmed_reads: f.trimmed_reads,
+                trimmed_reads_percent: f.trimmed_pct(),
+                trim_output_path: f.trim_output_path.clone(),
                 top_kmers: f.top_kmers(20),
             }
         })
@@ -73,7 +81,7 @@ pub fn export_json(state: &SharedState, output_dir: &str) -> io::Result<String> 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let report = JsonReport {
         tool: "BioFastq-A",
-        version: "2.0.0",
+        version: "2.1.0",
         generated: now,
         processing_time_seconds: state.elapsed_secs(),
         files,
@@ -137,8 +145,18 @@ h3{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;le
 .adapter-list{margin-top:8px;padding:0;}
 .adapter-list li{list-style:none;font-size:12px;font-family:monospace;color:var(--muted);padding:2px 0;}
 .adapter-list li::before{content:"▸ ";color:var(--accent);}
-/* K-mer table */
-.kmer-wrap{display:flex;gap:20px;flex-wrap:wrap;}
+/* Duplication gauge */
+.dup-gauge-wrap{display:flex;align-items:center;gap:16px;}
+.dup-gauge-track{flex:1;height:16px;background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
+.dup-gauge-fill{height:100%;border-radius:8px;transition:width .3s;}
+/* Per-tile table */
+.tile-table{width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;}
+.tile-table th{background:var(--card2);color:var(--muted);padding:5px 10px;text-align:left;border:1px solid var(--border);}
+.tile-table td{padding:4px 10px;border:1px solid var(--border);}
+/* Trim info */
+.trim-box{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:16px;}
+.trim-box p{font-size:13px;color:var(--muted);margin:4px 0;}
+.trim-box code{color:var(--accent);font-family:monospace;font-size:12px;}
 /* Footer */
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;padding-top:20px;border-top:1px solid var(--border);}
 "#;
@@ -325,12 +343,63 @@ function drawKmer(id, data) {
   });
 }
 
+/* ---------- Per-tile quality ---------- */
+function drawTile(id, data) {
+  var c = document.getElementById(id);
+  if (!c || !data || !data.length) return;
+  var ctx = c.getContext('2d');
+  var W = c.clientWidth || c.width; c.width = W;
+  var H = c.height;
+  var p = {t:18,r:12,b:36,l:60};
+  var pw = W-p.l-p.r, ph = H-p.t-p.b, MQ = 42;
+  ctx.clearRect(0,0,W,H);
+
+  var n = data.length;
+  var bw = pw / n;
+  var minQ = Math.min.apply(null, data.map(function(d){return d[1];}));
+  var maxQ = Math.max.apply(null, data.map(function(d){return d[1];}));
+  var rng = maxQ - minQ || 1;
+
+  data.forEach(function(d,i){
+    var q = d[1];
+    var x = p.l + i*bw;
+    var bh = ((q - minQ) / rng) * ph;
+    var y = p.t + ph - bh;
+    /* colour: red→yellow→green */
+    var t = (q - minQ) / rng;
+    var r = Math.round(248*(1-t) + 63*t);
+    var g = Math.round(81*(1-t) + 185*t);
+    var b2 = Math.round(73*(1-t) + 80*t);
+    ctx.fillStyle = 'rgba('+r+','+g+','+b2+',0.8)';
+    ctx.fillRect(x+0.5, y, Math.max(1,bw-1), bh);
+  });
+
+  ctx.strokeStyle='#30363d'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,H-p.b); ctx.lineTo(W-p.r,H-p.b); ctx.stroke();
+
+  ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='right';
+  [minQ, (minQ+maxQ)/2, maxQ].forEach(function(q){
+    var y=p.t+(1-(q-minQ)/rng)*ph;
+    ctx.fillText(q.toFixed(1),p.l-5,y+4);
+  });
+
+  ctx.textAlign='center';
+  var lblN = Math.min(8, n);
+  for(var i=0; i<lblN; i++){
+    var idx=Math.round(i*(n-1)/(Math.max(lblN-1,1)));
+    var x=p.l+(idx+0.5)*bw;
+    ctx.fillText(data[idx][0], x, H-p.b+14);
+  }
+  ctx.fillText('Tile ID', p.l+pw/2, H-2);
+}
+
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
     drawQual('qual-'+i, f.qual);
     drawLen('len-'+i, f.len);
     drawKmer('kmer-'+i, f.kmers);
+    if (f.tiles && f.tiles.length) drawTile('tile-'+i, f.tiles);
   });
 });
 "#;
@@ -551,6 +620,79 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
 
     s.push_str("</div>\n"); // charts-row
 
+    // --- Row 3: Duplication + Per-tile + Trim info ---
+    s.push_str("<div class=\"charts-row\">\n");
+
+    // Duplication card
+    let dup_class = dup_status_class(f.dup_rate_pct);
+    let dup_bar_color = match dup_class {
+        "pass" => "var(--green)",
+        "warn" => "var(--yellow)",
+        _ => "var(--red)",
+    };
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Duplication Rate (estimate)</h3>\n");
+    s.push_str("<div class=\"dup-gauge-wrap\" style=\"margin-bottom:12px\">\n");
+    s.push_str(&format!(
+        "<span class=\"stat-value {}\" style=\"font-size:32px;min-width:80px\">{:.1}%</span>\n",
+        dup_class, f.dup_rate_pct
+    ));
+    s.push_str("<div class=\"dup-gauge-track\">\n");
+    s.push_str(&format!(
+        "<div class=\"dup-gauge-fill\" style=\"width:{:.1}%;background:{}\"></div>\n",
+        f.dup_rate_pct.min(100.0),
+        dup_bar_color
+    ));
+    s.push_str("</div>\n</div>\n");
+    s.push_str("<p class=\"chart-note\">Estimated from fingerprint hashing of first 200,000 reads. &lt;5% = pass &nbsp;|&nbsp; 5–20% = warn &nbsp;|&nbsp; &gt;20% = high</p>\n");
+    s.push_str("</div>\n");
+
+    // Per-tile quality card (only if Illumina data was detected)
+    let tile_data = f.sorted_tile_quality();
+    if !tile_data.is_empty() {
+        s.push_str("<div class=\"chart-box\">\n");
+        s.push_str("<h3>Per-Tile Quality Score</h3>\n");
+        s.push_str(&format!(
+            "<canvas id=\"tile-{}\" width=\"600\" height=\"200\"></canvas>\n",
+            idx
+        ));
+        s.push_str(&format!(
+            "<p class=\"chart-note\">{} Illumina tiles detected. Bars coloured red→green by quality.</p>\n",
+            tile_data.len()
+        ));
+        s.push_str("</div>\n");
+    } else {
+        // No Illumina tiles — show note
+        s.push_str("<div class=\"chart-box\">\n");
+        s.push_str("<h3>Per-Tile Quality Score</h3>\n");
+        s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No Illumina tile information found in read headers.<br>Per-tile QC requires standard Illumina CASAVA 1.8+ headers.</p>\n");
+        s.push_str("</div>\n");
+    }
+
+    s.push_str("</div>\n"); // charts-row
+
+    // Trim output info (only shown when trimming was active)
+    if f.trim_output_path.is_some() || f.trimmed_reads > 0 {
+        s.push_str("<div class=\"trim-box\" style=\"margin-top:16px\">\n");
+        s.push_str("<h3 style=\"margin-bottom:8px\">Adapter Trim Output</h3>\n");
+        s.push_str(&format!(
+            "<p>Reads with adapters trimmed: <strong>{}</strong> ({:.1}%)</p>\n",
+            format_number(f.trimmed_reads),
+            f.trimmed_pct()
+        ));
+        s.push_str(&format!(
+            "<p>Bases removed by trimming: <strong>{}</strong></p>\n",
+            format_bases(f.trimmed_bases_removed)
+        ));
+        if let Some(ref tp) = f.trim_output_path {
+            s.push_str(&format!(
+                "<p>Trimmed output: <code>{}</code></p>\n",
+                escape_html(tp)
+            ));
+        }
+        s.push_str("</div>\n");
+    }
+
     s.push_str("</div>\n</div>\n"); // file-body + file-section
     s
 }
@@ -569,6 +711,7 @@ fn build_summary_table(files: &[&FileStats]) -> String {
         "Avg Quality",
         "Q30%",
         "Adapter%",
+        "Dup~%",
     ] {
         s.push_str(&format!("<th>{}</th>", hdr));
     }
@@ -592,6 +735,7 @@ fn build_summary_table(files: &[&FileStats]) -> String {
         s.push_str(&format!("<td>Q{:.1}</td>", f.avg_quality()));
         s.push_str(&format!("<td>{:.1}%</td>", f.q30_pct()));
         s.push_str(&format!("<td>{:.2}%</td>", f.adapter_pct()));
+        s.push_str(&format!("<td>{:.1}%</td>", f.dup_rate_pct));
         s.push_str("</tr>\n");
     }
     s.push_str("</tbody></table>\n");
@@ -610,11 +754,18 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         .into_iter()
         .map(|(k, v)| serde_json::json!([k, v]))
         .collect();
+    // Per-tile: [[tile_id, avg_quality], ...]
+    let tile_json: Vec<serde_json::Value> = f
+        .sorted_tile_quality()
+        .into_iter()
+        .map(|(t, q)| serde_json::json!([t, q]))
+        .collect();
 
     serde_json::json!({
         "qual": qual_per_pos,
         "len": len_dist,
         "kmers": kmer_json,
+        "tiles": tile_json,
     })
 }
 
@@ -653,6 +804,16 @@ fn gc_class(gc: f64) -> &'static str {
     if gc >= 35.0 && gc <= 65.0 {
         "pass"
     } else if gc >= 25.0 && gc <= 75.0 {
+        "warn"
+    } else {
+        "fail"
+    }
+}
+
+fn dup_status_class(pct: f64) -> &'static str {
+    if pct < 5.0 {
+        "pass"
+    } else if pct < 20.0 {
         "warn"
     } else {
         "fail"

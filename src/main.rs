@@ -12,53 +12,59 @@ use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
-use types::{format_number, ProcessingStatus, SharedState};
+use types::{format_number, ProcessConfig, ProcessingStatus, SharedState};
 
 // ---------------------------------------------------------------------------
-// CLI help / argument parsing
+// CLI
 // ---------------------------------------------------------------------------
 
 fn print_help() {
     eprintln!(
         r#"
-BioFastq-A v2.0.0 — High-performance FASTQ/FASTA quality analysis
+BioFastq-A v2.1.0 — High-performance FASTQ/FASTA quality analysis
 
 USAGE:
   biofastq-a [OPTIONS] <file> [<file2> ...]
 
 ARGUMENTS:
-  <file>     FASTQ or FASTA file(s) to analyse. Gzipped files (.gz) are
-             supported automatically.
+  <file>              FASTQ or FASTA file(s) to analyse.
+                      Gzipped (.gz) files are handled automatically.
 
 OPTIONS:
-  --headless         Run without interactive TUI (batch/script mode)
-  --output-dir <dir> Directory for report files (default: current directory)
-  --help, -h         Show this help message
+  --headless          Run without interactive TUI (for scripts / CI)
+  --output-dir <dir>  Directory for reports and trimmed output
+                      (default: current directory)
+  --trim              Trim adapter sequences and write cleaned reads to
+                      <stem>_trimmed.fastq.gz alongside the reports
+  --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
+  --help, -h          Show this help message
 
 OUTPUT:
-  <stem>_report.html — Self-contained HTML report with interactive charts
-  <stem>_report.json — Machine-readable JSON report
+  <stem>_report.html      Self-contained HTML report with interactive charts
+  <stem>_report.json      Machine-readable JSON report
+  <stem>_trimmed.fastq.gz Adapter-trimmed reads (when --trim is used)
 
 EXAMPLES:
   biofastq-a sample.fastq
+  biofastq-a reads.fastq.gz --trim --output-dir ./qc
   biofastq-a *.fastq.gz --headless --output-dir ./reports
   biofastq-a reads.fasta --headless
 "#
     );
 }
 
-struct Config {
+struct CliConfig {
     input_files: Vec<String>,
     headless: bool,
     output_dir: String,
+    trim: bool,
+    min_length: u64,
 }
 
-fn parse_args() -> Result<Config, String> {
+fn parse_args() -> Result<CliConfig, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
-    if args.is_empty()
-        || args.iter().any(|a| a == "--help" || a == "-h")
-    {
+    if args.is_empty() || args.iter().any(|a| a == "--help" || a == "-h") {
         print_help();
         std::process::exit(0);
     }
@@ -66,11 +72,14 @@ fn parse_args() -> Result<Config, String> {
     let mut input_files = Vec::new();
     let mut headless = false;
     let mut output_dir = ".".to_string();
+    let mut trim = false;
+    let mut min_length: u64 = 20;
     let mut i = 0;
 
     while i < args.len() {
         match args[i].as_str() {
             "--headless" => headless = true,
+            "--trim" => trim = true,
             "--output-dir" => {
                 i += 1;
                 if i >= args.len() {
@@ -78,8 +87,17 @@ fn parse_args() -> Result<Config, String> {
                 }
                 output_dir = args[i].clone();
             }
+            "--min-length" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--min-length requires a value".into());
+                }
+                min_length = args[i]
+                    .parse()
+                    .map_err(|_| format!("--min-length must be an integer, got '{}'", args[i]))?;
+            }
             arg if arg.starts_with("--") => {
-                return Err(format!("Unknown option: {}", arg));
+                return Err(format!("Unknown option: {}  (use --help for usage)", arg));
             }
             path => input_files.push(path.to_string()),
         }
@@ -90,10 +108,12 @@ fn parse_args() -> Result<Config, String> {
         return Err("No input files specified. Use --help for usage.".into());
     }
 
-    Ok(Config {
+    Ok(CliConfig {
         input_files,
         headless,
         output_dir,
+        trim,
+        min_length,
     })
 }
 
@@ -110,7 +130,7 @@ fn main() {
         }
     };
 
-    // Validate that all input files exist before starting
+    // Validate input files
     for path in &cfg.input_files {
         match std::fs::metadata(path) {
             Ok(m) if m.is_file() => {}
@@ -134,10 +154,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    let process_config = ProcessConfig {
+        trim_output: cfg.trim,
+        min_length: cfg.min_length,
+        output_dir: cfg.output_dir.clone(),
+    };
+
     let n_files = cfg.input_files.len();
     let state = Arc::new(Mutex::new(SharedState::new(n_files)));
 
-    // Panic hook — always restore the terminal
+    // Panic hook — always restore terminal
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
@@ -149,18 +175,16 @@ fn main() {
     let state_worker = Arc::clone(&state);
     let files = cfg.input_files.clone();
     let handle = thread::spawn(move || {
-        analysis::process_files(files, state_worker);
+        analysis::process_files(files, state_worker, process_config);
     });
 
     if cfg.headless {
-        // ----- headless mode -----
         let _ = handle.join();
     } else {
-        // ----- interactive TUI mode -----
         let mut terminal = match tui::setup_terminal() {
             Ok(t) => t,
             Err(e) => {
-                eprintln!("Failed to set up terminal: {}", e);
+                eprintln!("Failed to initialise terminal: {}", e);
                 std::process::exit(1);
             }
         };
@@ -178,13 +202,11 @@ fn main() {
                 }
             }
 
-            // Exit UI automatically when all processing is done
             if matches!(
                 snap.status,
                 ProcessingStatus::Completed | ProcessingStatus::Error(_)
             ) {
-                // Give the user a moment to see the final state
-                thread::sleep(Duration::from_millis(500));
+                thread::sleep(Duration::from_millis(600));
                 break;
             }
         }
@@ -193,49 +215,60 @@ fn main() {
         let _ = handle.join();
     }
 
-    // ----- Report export -----
+    // ----- Report export & terminal summary -----
     let snap = state.lock().unwrap().clone();
 
     match &snap.status {
         ProcessingStatus::Completed => {
             println!("\nAnalysis complete!\n");
 
-            // Print summary for each file
             for f in snap.all_files() {
                 let (n50, n90) = f.compute_n50_n90();
                 let fname = std::path::Path::new(&f.file_path)
                     .file_name()
                     .and_then(|n| n.to_str())
                     .unwrap_or(&f.file_path);
-                println!("  File:          {}", fname);
-                println!("  Reads:         {}", format_number(f.read_count));
-                println!("  Total bases:   {}", types::format_bases(f.total_bases));
-                println!("  Avg length:    {:.1} bp", f.avg_length());
+
+                println!("  File:            {}", fname);
+                println!("  Reads:           {}", format_number(f.read_count));
+                println!("  Total bases:     {}", types::format_bases(f.total_bases));
+                println!("  Avg length:      {:.1} bp", f.avg_length());
                 println!(
-                    "  Min/Max:       {}/{} bp",
+                    "  Min / Max:       {} / {} bp",
                     f.effective_min_length(),
                     f.max_length
                 );
-                println!("  N50:           {} bp", n50);
-                println!("  N90:           {} bp", n90);
-                println!("  GC content:    {:.2}%", f.gc_content());
-                println!("  Avg quality:   Q{:.1}", f.avg_quality());
-                println!("  Q20 reads:     {:.1}%", f.q20_pct());
-                println!("  Q30 reads:     {:.1}%", f.q30_pct());
-                println!("  Adapter cont:  {:.2}%", f.adapter_pct());
+                println!("  N50:             {} bp", n50);
+                println!("  N90:             {} bp", n90);
+                println!("  GC content:      {:.2}%", f.gc_content());
+                println!("  Avg quality:     Q{:.1}", f.avg_quality());
+                println!("  Q20 reads:       {:.1}%", f.q20_pct());
+                println!("  Q30 reads:       {:.1}%", f.q30_pct());
+                println!("  Adapter cont:    {:.2}%", f.adapter_pct());
+                println!("  Dup rate (est):  {:.1}%", f.dup_rate_pct);
+                if f.trimmed_reads > 0 {
+                    println!(
+                        "  Trimmed reads:   {} ({:.1}%)",
+                        format_number(f.trimmed_reads),
+                        f.trimmed_pct()
+                    );
+                    if let Some(ref tp) = f.trim_output_path {
+                        println!("  Trim output:     {}", tp);
+                    }
+                }
+                if !f.per_tile_quality.is_empty() {
+                    println!("  Illumina tiles:  {}", f.per_tile_quality.len());
+                }
                 println!();
             }
 
-            // Export HTML report
             match report::export_html(&snap, &cfg.output_dir) {
-                Ok(path) => println!("HTML report: {}", path),
-                Err(e) => eprintln!("Warning: Could not write HTML report: {}", e),
+                Ok(path) => println!("HTML report:  {}", path),
+                Err(e) => eprintln!("Warning: HTML report failed: {}", e),
             }
-
-            // Export JSON report
             match report::export_json(&snap, &cfg.output_dir) {
-                Ok(path) => println!("JSON report: {}", path),
-                Err(e) => eprintln!("Warning: Could not write JSON report: {}", e),
+                Ok(path) => println!("JSON report:  {}", path),
+                Err(e) => eprintln!("Warning: JSON report failed: {}", e),
             }
 
             println!("\nProcessing time: {:.1}s", snap.elapsed_secs());
