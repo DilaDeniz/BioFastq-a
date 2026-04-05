@@ -39,6 +39,7 @@ OPTIONS:
   --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
   --adapter <seq>     Additional adapter sequence to screen/trim (repeatable)
   --quality-trim <Q>  Trim 3' bases with Phred quality below Q (default: off)
+  --strict            Abort on first malformed record (default: skip and warn)
   --version, -V       Print version and exit
   --help, -h          Show this help message
 
@@ -64,6 +65,7 @@ struct CliConfig {
     min_length: u64,
     custom_adapters: Vec<Vec<u8>>,
     quality_trim: u8,
+    strict: bool,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -86,6 +88,7 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut min_length: u64 = 20;
     let mut custom_adapters: Vec<Vec<u8>> = Vec::new();
     let mut quality_trim: u8 = 0;
+    let mut strict = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -124,6 +127,7 @@ fn parse_args() -> Result<CliConfig, String> {
                     .parse()
                     .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
             }
+            "--strict" => strict = true,
             arg if arg.starts_with("--") => {
                 return Err(format!("Unknown option: {}  (use --help for usage)", arg));
             }
@@ -144,6 +148,7 @@ fn parse_args() -> Result<CliConfig, String> {
         min_length,
         custom_adapters,
         quality_trim,
+        strict,
     })
 }
 
@@ -190,6 +195,7 @@ fn main() {
         output_dir: cfg.output_dir.clone(),
         custom_adapters: cfg.custom_adapters.clone(),
         quality_trim_threshold: cfg.quality_trim,
+        strict: cfg.strict,
     };
 
     let n_files = cfg.input_files.len();
@@ -274,8 +280,8 @@ fn main() {
                 println!("  N90:             {} bp", n90);
                 println!("  GC content:      {:.2}%", f.gc_content());
                 println!("  Avg quality:     Q{:.1}", f.avg_quality());
-                println!("  Q20 reads:       {:.1}%", f.q20_pct());
-                println!("  Q30 reads:       {:.1}%", f.q30_pct());
+                println!("  Q20 bases:       {:.1}%", f.q20_pct());
+                println!("  Q30 bases:       {:.1}%", f.q30_pct());
                 println!("  Adapter cont:    {:.2}%", f.adapter_pct());
                 println!("  Dup rate (est):  {:.1}%", f.dup_rate_pct);
                 if f.trimmed_reads > 0 {

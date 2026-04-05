@@ -55,6 +55,8 @@ pub struct ProcessConfig {
     pub custom_adapters: Vec<Vec<u8>>,
     /// If > 0, quality-trim the 3' end: drop trailing bases with Phred < threshold
     pub quality_trim_threshold: u8,
+    /// Abort on first malformed record instead of skipping it
+    pub strict: bool,
 }
 
 impl Default for ProcessConfig {
@@ -65,6 +67,7 @@ impl Default for ProcessConfig {
             output_dir: ".".to_string(),
             custom_adapters: Vec::new(),
             quality_trim_threshold: 0,
+            strict: false,
         }
     }
 }
@@ -84,8 +87,8 @@ pub struct FileStats {
     // Quality
     pub quality_sum: u64,
     pub quality_bases: u64,
-    pub q20_reads: u64,
-    pub q30_reads: u64,
+    pub q20_bases: u64,
+    pub q30_bases: u64,
     // k-mer
     pub kmer_counts: HashMap<[u8; 4], u64>,
     // Progress
@@ -124,8 +127,8 @@ impl FileStats {
             gc_count: 0,
             quality_sum: 0,
             quality_bases: 0,
-            q20_reads: 0,
-            q30_reads: 0,
+            q20_bases: 0,
+            q30_bases: 0,
             kmer_counts: HashMap::new(),
             bytes_processed: 0,
             min_length: u64::MAX,
@@ -172,17 +175,13 @@ impl FileStats {
     }
 
     pub fn q20_pct(&self) -> f64 {
-        if self.read_count == 0 {
-            return 0.0;
-        }
-        self.q20_reads as f64 / self.read_count as f64 * 100.0
+        if self.quality_bases == 0 { return 0.0; }
+        self.q20_bases as f64 / self.quality_bases as f64 * 100.0
     }
 
     pub fn q30_pct(&self) -> f64 {
-        if self.read_count == 0 {
-            return 0.0;
-        }
-        self.q30_reads as f64 / self.read_count as f64 * 100.0
+        if self.quality_bases == 0 { return 0.0; }
+        self.q30_bases as f64 / self.quality_bases as f64 * 100.0
     }
 
     /// Returns 0 if no reads have been seen yet (min_length is u64::MAX in that case)
