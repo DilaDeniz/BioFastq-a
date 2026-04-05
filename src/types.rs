@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MAX_QUAL_POSITION: usize = 500;
-pub const FLUSH_INTERVAL: u64 = 10_000;
-pub const BATCH_SIZE: usize = 50_000;
+pub const FLUSH_INTERVAL: u64 = 50_000;   // less mutex contention vs old 10k
+pub const PARALLEL_BATCH: usize = 20_000; // records read before parallel processing
 pub const MAX_LOG_ENTRIES: usize = 1000;
 
 // Adapter sequences to check (name, sequence prefix to match)

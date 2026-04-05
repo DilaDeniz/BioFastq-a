@@ -112,12 +112,15 @@ explorer.exe sample_report.html
 biofastq-a [OPTIONS] <file> [<file2> ...]
 
 OPTIONS:
-  --headless          No TUI — for scripts and CI
-  --output-dir <dir>  Where to write reports (default: current directory)
-  --trim              Trim adapters; write <stem>_trimmed.fastq.gz
-  --min-length <N>    Drop trimmed reads shorter than N bp (default: 20)
-  --version, -V       Print version
-  --help, -h          Show help
+  --headless             No TUI — for scripts and CI
+  --output-dir <dir>     Where to write reports (default: current directory)
+  --trim                 Trim adapters; write <stem>_trimmed.fastq.gz
+  --min-length <N>       Drop trimmed reads shorter than N bp (default: 20)
+  --adapter <seq>        Additional adapter sequence to screen/trim (repeatable)
+  --quality-trim <Q>     Trim 3' bases with Phred quality below Q (default: off)
+  --strict               Abort on first malformed record (default: skip & warn)
+  --version, -V          Print version
+  --help, -h             Show help
 ```
 
 ### Multiple files
@@ -139,9 +142,10 @@ is shown at the top.
 | **Read length distribution** | Bar chart; works for short reads (Illumina) and long reads (Nanopore/PacBio) |
 | **N50 / N90** | Computed from the length histogram — no memory overhead |
 | **GC content** | Per-read and overall |
-| **Q20 / Q30 pass rates** | Fraction of reads with mean quality ≥ threshold |
-| **Adapter detection** | 7 common Illumina/Nextera/Poly-A sequences checked per read |
+| **Q20 / Q30 pass rates** | Per-base fraction with Phred ≥ 20 / ≥ 30 (fastp-compatible methodology) |
+| **Adapter detection** | 7 built-in Illumina/Nextera/Poly-A sequences + `--adapter <seq>` for custom |
 | **Adapter trimming** | `--trim` hard-clips adapters; outputs gzipped FASTQ |
+| **Quality trimming** | `--quality-trim <Q>` 3′ sliding-window trim below Phred Q |
 | **Duplication estimate** | Fingerprint-hashes first 200k reads; reports % likely duplicates |
 | **Per-tile quality** | Parses Illumina CASAVA 1.8+ tile IDs from headers; bar chart per tile |
 | **Top 20 k-mers** | Parallel 4-mer counting using Rayon |
@@ -195,6 +199,34 @@ in a single streaming pass. Typical throughput on a modern desktop:
 | Offline / no deps | Yes | Requires JVM |
 | Docker image | Yes | Official image |
 | gzip streaming | Yes | Yes |
+
+---
+
+## Comparison with fastp
+
+fastp is a widely used C++ QC + trimming tool. This table shows where each tool has an edge:
+
+| Feature | BioFastq-A | fastp |
+|---|---|---|
+| Language | Rust | C++ |
+| Interactive TUI dashboard | **Yes** | No |
+| N50 / N90 statistics | **Yes** | No |
+| Per-tile Illumina quality | **Yes** | No |
+| Top k-mer enrichment table | **Yes** | No |
+| Multi-file batch in one run | **Yes** | No |
+| JSON + HTML report | **Yes** | Yes |
+| Q20 / Q30 methodology | Per-base (identical to fastp) | Per-base |
+| Built-in adapter trimming | Yes (`--trim`) | **Yes (default)** |
+| Paired-end support | No | **Yes** |
+| Poly-G tail trimming (NovaSeq) | No | **Yes** |
+| Auto adapter detection | No | **Yes** |
+| Throughput (8-core, NVMe) | ~200–300 MB/s | ~400+ MB/s |
+| No runtime dependencies | Yes (static binary) | Yes (static binary) |
+| Docker image | Yes | Yes |
+
+**Summary:** BioFastq-A is the better choice when you need N50/N90, a live TUI,
+k-mer analysis, or multi-file QC in one command. fastp is faster for pure
+adapter trimming workflows, paired-end data, and automatic adapter detection.
 
 ---
 

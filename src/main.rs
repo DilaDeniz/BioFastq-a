@@ -153,6 +153,55 @@ fn parse_args() -> Result<CliConfig, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+fn print_file_summary(f: &types::FileStats) {
+    let (n50, n90) = f.compute_n50_n90();
+    let fname = std::path::Path::new(&f.file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&f.file_path);
+
+    println!(
+        "  File:            {}\n  \
+         Reads:           {}\n  \
+         Total bases:     {}\n  \
+         Avg length:      {:.1} bp\n  \
+         Min / Max:       {} / {} bp\n  \
+         N50 / N90:       {} / {} bp\n  \
+         GC content:      {:.2}%\n  \
+         Avg quality:     Q{:.1}\n  \
+         Q20 bases:       {:.1}%\n  \
+         Q30 bases:       {:.1}%\n  \
+         Adapter cont:    {:.2}%\n  \
+         Dup rate (est):  {:.1}%",
+        fname,
+        format_number(f.read_count),
+        types::format_bases(f.total_bases),
+        f.avg_length(),
+        f.effective_min_length(), f.max_length,
+        n50, n90,
+        f.gc_content(),
+        f.avg_quality(),
+        f.q20_pct(),
+        f.q30_pct(),
+        f.adapter_pct(),
+        f.dup_rate_pct,
+    );
+    if f.trimmed_reads > 0 {
+        println!("  Trimmed reads:   {} ({:.1}%)", format_number(f.trimmed_reads), f.trimmed_pct());
+        if let Some(ref tp) = f.trim_output_path {
+            println!("  Trim output:     {}", tp);
+        }
+    }
+    if !f.per_tile_quality.is_empty() {
+        println!("  Illumina tiles:  {}", f.per_tile_quality.len());
+    }
+    println!();
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -259,47 +308,9 @@ fn main() {
     match &snap.status {
         ProcessingStatus::Completed => {
             println!("\nAnalysis complete!\n");
-
             for f in snap.all_files() {
-                let (n50, n90) = f.compute_n50_n90();
-                let fname = std::path::Path::new(&f.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&f.file_path);
-
-                println!("  File:            {}", fname);
-                println!("  Reads:           {}", format_number(f.read_count));
-                println!("  Total bases:     {}", types::format_bases(f.total_bases));
-                println!("  Avg length:      {:.1} bp", f.avg_length());
-                println!(
-                    "  Min / Max:       {} / {} bp",
-                    f.effective_min_length(),
-                    f.max_length
-                );
-                println!("  N50:             {} bp", n50);
-                println!("  N90:             {} bp", n90);
-                println!("  GC content:      {:.2}%", f.gc_content());
-                println!("  Avg quality:     Q{:.1}", f.avg_quality());
-                println!("  Q20 bases:       {:.1}%", f.q20_pct());
-                println!("  Q30 bases:       {:.1}%", f.q30_pct());
-                println!("  Adapter cont:    {:.2}%", f.adapter_pct());
-                println!("  Dup rate (est):  {:.1}%", f.dup_rate_pct);
-                if f.trimmed_reads > 0 {
-                    println!(
-                        "  Trimmed reads:   {} ({:.1}%)",
-                        format_number(f.trimmed_reads),
-                        f.trimmed_pct()
-                    );
-                    if let Some(ref tp) = f.trim_output_path {
-                        println!("  Trim output:     {}", tp);
-                    }
-                }
-                if !f.per_tile_quality.is_empty() {
-                    println!("  Illumina tiles:  {}", f.per_tile_quality.len());
-                }
-                println!();
+                print_file_summary(f);
             }
-
             match report::export_html(&snap, &cfg.output_dir) {
                 Ok(path) => println!("HTML report:  {}", path),
                 Err(e) => eprintln!("Warning: HTML report failed: {}", e),
@@ -308,15 +319,13 @@ fn main() {
                 Ok(path) => println!("JSON report:  {}", path),
                 Err(e) => eprintln!("Warning: JSON report failed: {}", e),
             }
-
             let elapsed = snap.elapsed_secs();
             let total_reads: u64 = snap.all_files().iter().map(|f| f.read_count).sum();
             let total_bytes: u64 = snap.all_files().iter().map(|f| f.file_size).sum();
-            let reads_per_sec = if elapsed > 0.0 { total_reads as f64 / elapsed } else { 0.0 };
-            let mb_per_sec = if elapsed > 0.0 { total_bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
-
-            println!("Processing time:  {:.1}s", elapsed);
-            println!("Throughput:       {:.0} reads/s  |  {:.0} MB/s", reads_per_sec, mb_per_sec);
+            let rps = if elapsed > 0.0 { total_reads as f64 / elapsed } else { 0.0 };
+            let mbs = if elapsed > 0.0 { total_bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
+            println!("\nProcessing time:  {:.1}s", elapsed);
+            println!("Throughput:       {:.0} reads/s  |  {:.0} MB/s", rps, mbs);
         }
         ProcessingStatus::Error(e) => {
             eprintln!("\nAnalysis failed: {}", e);
