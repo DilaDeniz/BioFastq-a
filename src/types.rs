@@ -72,8 +72,6 @@ impl Default for ProcessConfig {
     }
 }
 
-/// How many reads to sample for duplication estimation
-pub const DUP_SAMPLE_SIZE: usize = 200_000;
 
 /// Per-file statistics accumulated during analysis
 #[derive(Clone)]
@@ -105,7 +103,7 @@ pub struct FileStats {
     pub trimmed_reads: u64,
     pub trimmed_bases_removed: u64,
     pub trim_output_path: Option<String>,
-    // Duplication estimate (sampled from first DUP_SAMPLE_SIZE reads)
+    // Duplication estimate via HyperLogLog (all reads)
     pub dup_rate_pct: f64,
     // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
     pub per_tile_quality: HashMap<u32, (u64, u64)>,

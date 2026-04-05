@@ -4,17 +4,18 @@ mod kmers;
 mod metrics;
 
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use hyperloglog::HyperLogLog;
 use needletail::parse_fastx_file;
 use needletail::Sequence;
 use rayon::prelude::*;
 
 use crate::types::{
     format_number, FileStats, LogLevel, ProcessConfig, ProcessingStatus, SharedState,
-    DUP_SAMPLE_SIZE, FLUSH_INTERVAL, PARALLEL_BATCH,
+    FLUSH_INTERVAL, PARALLEL_BATCH,
 };
 
 use self::io::{open_writer, write_fastq_record};
@@ -146,8 +147,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; 43];
-    let mut dup_seen: HashSet<u64> = HashSet::with_capacity(DUP_SAMPLE_SIZE);
-    let mut dup_sampled = 0u64;
+    // HyperLogLog: ~1% error rate, counts all reads, ~10 KB RAM
+    let mut hll = HyperLogLog::new(0.01);
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
     let mut error_occurred = false;
@@ -231,11 +232,9 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // --- Duplication sampling (sequential, only first DUP_SAMPLE_SIZE) ---
+        // --- Duplication estimation via HyperLogLog (all reads) ---
         for fp in &acc.fingerprints {
-            if dup_sampled >= DUP_SAMPLE_SIZE as u64 { break; }
-            dup_seen.insert(*fp);
-            dup_sampled += 1;
+            hll.insert(fp);
         }
 
         // --- K-mer counting for this batch ---
@@ -350,8 +349,9 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
     drop(trim_writer);
 
-    let dup_rate = if dup_sampled > 0 {
-        (1.0 - dup_seen.len() as f64 / dup_sampled as f64) * 100.0
+    let dup_rate = if read_count > 0 {
+        let unique = hll.len();
+        (1.0 - (unique / read_count as f64).min(1.0)) * 100.0
     } else { 0.0 };
 
     let mut s = state.lock().unwrap();
