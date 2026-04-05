@@ -39,6 +39,8 @@ OPTIONS:
   --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
   --adapter <seq>     Additional adapter sequence to screen/trim (repeatable)
   --quality-trim <Q>  Trim 3' bases with Phred quality below Q (default: off)
+  --in2 <file>        R2 file for paired-end mode (R1 is the positional argument)
+  --threads <N>       Number of CPU threads (default: all cores)
   --strict            Abort on first malformed record (default: skip and warn)
   --version, -V       Print version and exit
   --help, -h          Show this help message
@@ -66,6 +68,8 @@ struct CliConfig {
     custom_adapters: Vec<Vec<u8>>,
     quality_trim: u8,
     strict: bool,
+    threads: Option<usize>,
+    paired_r2: Option<String>,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -89,6 +93,8 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut custom_adapters: Vec<Vec<u8>> = Vec::new();
     let mut quality_trim: u8 = 0;
     let mut strict = false;
+    let mut threads: Option<usize> = None;
+    let mut paired_r2: Option<String> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -128,6 +134,26 @@ fn parse_args() -> Result<CliConfig, String> {
                     .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
             }
             "--strict" => strict = true,
+            "--in2" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--in2 requires a file path".into());
+                }
+                paired_r2 = Some(args[i].clone());
+            }
+            "--threads" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--threads requires a value".into());
+                }
+                let n: usize = args[i]
+                    .parse()
+                    .map_err(|_| format!("--threads must be a positive integer, got '{}'", args[i]))?;
+                if n == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(n);
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("Unknown option: {}  (use --help for usage)", arg));
             }
@@ -149,6 +175,8 @@ fn parse_args() -> Result<CliConfig, String> {
         custom_adapters,
         quality_trim,
         strict,
+        threads,
+        paired_r2,
     })
 }
 
@@ -214,6 +242,14 @@ fn main() {
         }
     };
 
+    // Configure rayon thread pool
+    if let Some(n) = cfg.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .unwrap_or_else(|e| eprintln!("Warning: could not set thread count: {}", e));
+    }
+
     // Validate input files
     for path in &cfg.input_files {
         match std::fs::metadata(path) {
@@ -238,6 +274,12 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Validate --in2 is only used with a single R1 input
+    if cfg.paired_r2.is_some() && cfg.input_files.len() != 1 {
+        eprintln!("Error: --in2 requires exactly one R1 input file.");
+        std::process::exit(1);
+    }
+
     let process_config = ProcessConfig {
         trim_output: cfg.trim,
         min_length: cfg.min_length,
@@ -245,6 +287,7 @@ fn main() {
         custom_adapters: cfg.custom_adapters.clone(),
         quality_trim_threshold: cfg.quality_trim,
         strict: cfg.strict,
+        paired_end_r2: cfg.paired_r2.clone(),
     };
 
     let n_files = cfg.input_files.len();

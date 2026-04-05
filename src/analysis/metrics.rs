@@ -1,5 +1,6 @@
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
+use xxhash_rust::xxh3::xxh3_64;
+use crate::types::PHRED_BUCKETS;
 
 use crate::types::MAX_QUAL_POSITION;
 
@@ -45,7 +46,7 @@ impl Default for BatchAccum {
             length_histogram: HashMap::new(),
             quality_by_pos: vec![(0, 0); MAX_QUAL_POSITION],
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
-            quality_distribution: vec![0u64; 43],
+            quality_distribution: vec![0u64; PHRED_BUCKETS],
             per_tile: HashMap::new(),
             kmer_seqs: Vec::new(),
             fingerprints: Vec::new(),
@@ -146,7 +147,7 @@ impl BatchAccum {
                 self.base_composition[i][j] += other.base_composition[i][j];
             }
         }
-        for i in 0..43 {
+        for i in 0..PHRED_BUCKETS {
             self.quality_distribution[i] += other.quality_distribution[i];
         }
         for (k, v) in other.per_tile {
@@ -165,8 +166,7 @@ impl BatchAccum {
 // ---------------------------------------------------------------------------
 
 /// Hash the first 50 bytes of a sequence for duplication fingerprinting.
+/// Uses xxHash3 — fast, high-quality, low collision rate.
 pub fn fingerprint(seq: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    seq[..seq.len().min(50)].hash(&mut hasher);
-    hasher.finish()
+    xxh3_64(&seq[..seq.len().min(50)])
 }

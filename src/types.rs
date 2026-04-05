@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MAX_QUAL_POSITION: usize = 500;
-pub const FLUSH_INTERVAL: u64 = 50_000;   // less mutex contention vs old 10k
-pub const PARALLEL_BATCH: usize = 20_000; // records read before parallel processing
-pub const MAX_LOG_ENTRIES: usize = 1000;
+pub const FLUSH_INTERVAL: u64    = 50_000;
+pub const PARALLEL_BATCH: usize  = 20_000;
+pub const MAX_LOG_ENTRIES: usize = 1_000;
+/// Phred scores range 0–42; index directly into a 43-element array.
+pub const PHRED_BUCKETS: usize   = 43;
 
 // Adapter sequences to check (name, sequence prefix to match)
 pub const ADAPTERS: &[(&str, &[u8])] = &[
@@ -57,6 +59,9 @@ pub struct ProcessConfig {
     pub quality_trim_threshold: u8,
     /// Abort on first malformed record instead of skipping it
     pub strict: bool,
+    /// If set, treat input as paired-end: this is the R2 file path.
+    /// The primary input file is R1.
+    pub paired_end_r2: Option<String>,
 }
 
 impl Default for ProcessConfig {
@@ -68,6 +73,7 @@ impl Default for ProcessConfig {
             custom_adapters: Vec::new(),
             quality_trim_threshold: 0,
             strict: false,
+            paired_end_r2: None,
         }
     }
 }
@@ -140,7 +146,7 @@ impl FileStats {
             dup_rate_pct: 0.0,
             per_tile_quality: HashMap::new(),
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
-            quality_distribution: vec![0u64; 43],
+            quality_distribution: vec![0u64; PHRED_BUCKETS],
         }
     }
 
@@ -207,7 +213,7 @@ impl FileStats {
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
         let n50_thresh = (self.total_bases + 1) / 2;
-        let n90_thresh = (self.total_bases as f64 * 0.9) as u64;
+        let n90_thresh = self.total_bases * 9 / 10;
 
         let mut cumsum = 0u64;
         let mut n50 = 0u64;
@@ -362,7 +368,8 @@ impl SharedState {
             message,
         });
         if self.log_messages.len() > MAX_LOG_ENTRIES {
-            self.log_messages.drain(0..100);
+            // Drop oldest half to amortise repeated drains
+            self.log_messages.drain(0..MAX_LOG_ENTRIES / 2);
         }
     }
 
@@ -392,13 +399,13 @@ impl SharedState {
 
 pub fn format_number(n: u64) -> String {
     let s = n.to_string();
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut result = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        result.push(c);
-        let pos_from_end = len - i - 1;
-        if pos_from_end > 0 && pos_from_end % 3 == 0 {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut result = String::with_capacity(len + len / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        result.push(b as char);
+        let remaining = len - i - 1;
+        if remaining > 0 && remaining % 3 == 0 {
             result.push(',');
         }
     }
