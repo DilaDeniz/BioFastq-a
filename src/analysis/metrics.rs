@@ -125,8 +125,8 @@ impl BatchAccum {
             e.1 += count;
         }
 
-        // K-mer input
-        if seq.len() >= 4 {
+        // K-mer input — only sample first OVERREP_SAMPLE reads to avoid O(n) cost on large files
+        if seq.len() >= 4 && self.read_count <= crate::types::OVERREP_SAMPLE as u64 {
             self.kmer_seqs.push(seq.to_vec());
         }
     }
