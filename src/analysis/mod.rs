@@ -2,6 +2,7 @@ mod adapters;
 mod io;
 mod kmers;
 mod metrics;
+mod mmap_reader;
 
 
 use std::collections::HashMap;
@@ -151,6 +152,16 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
                     .unwrap_or_default(),
             ),
         );
+    }
+
+    // Use mmap zero-copy reader for plain FASTQ; fall back to needletail for gzip/fasta
+    let is_plain_fastq = !file_path.ends_with(".gz")
+        && !file_path.ends_with(".fasta")
+        && !file_path.ends_with(".fa");
+
+    if is_plain_fastq {
+        process_single_file_mmap(file_path, state, config, trim_path, file_size);
+        return;
     }
 
     let mut reader = match parse_fastx_file(&file_path) {
@@ -407,6 +418,223 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     s.log(LogLevel::Success, format!(
         "Done: {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup ~{:.1}% | {:.1} MB/s{}{}",
         format_number(read_count), gc_pct, avg_q, adapter_pct, dup_rate, mbps, trim_note, tile_note,
+    ));
+
+    if let Some(done) = s.current.take() {
+        s.completed_files.push(done);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// mmap-based zero-copy processing for plain FASTQ files
+// ---------------------------------------------------------------------------
+
+fn process_single_file_mmap(
+    file_path: String,
+    state: Arc<Mutex<SharedState>>,
+    config: &ProcessConfig,
+    trim_path: Option<String>,
+    file_size: u64,
+) {
+    let mut mmap_reader = match mmap_reader::MmapFastq::open(&file_path) {
+        Ok(r) => r,
+        Err(e) => {
+            let msg = format!("Cannot open {}: {}", file_path, e);
+            let mut s = state.lock().unwrap();
+            s.log(LogLevel::Error, msg.clone());
+            s.status = ProcessingStatus::Error(msg);
+            return;
+        }
+    };
+
+    let mut trim_writer: Option<Box<dyn std::io::Write>> = if let Some(ref tp) = trim_path {
+        match io::open_writer(tp) {
+            Ok(w) => Some(w),
+            Err(e) => {
+                let msg = format!("Cannot open trim output {}: {}", tp, e);
+                let mut s = state.lock().unwrap();
+                s.log(LogLevel::Error, msg.clone());
+                s.status = ProcessingStatus::Error(msg);
+                return;
+            }
+        }
+    } else { None };
+
+    // Running totals
+    let mut read_count        = 0u64;
+    let mut total_bases       = 0u64;
+    let mut gc_count          = 0u64;
+    let mut quality_sum       = 0u64;
+    let mut quality_bases     = 0u64;
+    let mut q20_bases         = 0u64;
+    let mut q30_bases         = 0u64;
+    let mut adapter_hits      = 0u64;
+    let mut trimmed_reads     = 0u64;
+    let mut trimmed_bases_removed = 0u64;
+    let mut min_length        = u64::MAX;
+    let mut max_length        = 0u64;
+    let mut bytes             = 0u64;
+    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut quality_by_pos    = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut base_composition  = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
+    let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
+    let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut hll               = Hll::new(0.01);
+    let mut flush_counter     = 0u64;
+    let mut total_flushed     = 0u64;
+
+    // Batch: collect owned records then process in parallel
+    loop {
+        let mut batch: Vec<OwnedRecord> = Vec::with_capacity(PARALLEL_BATCH);
+        let mut batch_bytes = 0u64;
+
+        while batch.len() < PARALLEL_BATCH {
+            match mmap_reader.next_record() {
+                None => break,
+                Some(rec) => {
+                    batch_bytes += rec.seq.len() as u64 + rec.id.len() as u64 + 4;
+                    batch.push(OwnedRecord {
+                        id:   rec.id.to_vec(),
+                        seq:  rec.seq.to_vec(),
+                        qual: Some(rec.qual.to_vec()),
+                    });
+                }
+            }
+        }
+
+        if batch.is_empty() { break; }
+        bytes += batch_bytes;
+
+        let acc: BatchAccum = batch
+            .par_iter()
+            .fold(BatchAccum::default, |mut acc, rec| {
+                let (eff_seq, eff_qual, adapter_hit) =
+                    trim_record(&rec.seq, rec.qual.as_deref(), config);
+                let tile_info = parse_illumina_tile(&rec.id).and_then(|tile_id| {
+                    eff_qual.map(|q| {
+                        let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                        (tile_id, phred_sum, q.len() as u64)
+                    })
+                });
+                let fp = fingerprint(eff_seq);
+                acc.process(eff_seq, eff_qual, tile_info, fp, adapter_hit);
+                acc
+            })
+            .reduce(BatchAccum::default, BatchAccum::merge);
+
+        for fp in &acc.fingerprints { hll.insert(fp); }
+        if !acc.kmer_seqs.is_empty() {
+            let kmers = count_kmers_parallel(&acc.kmer_seqs);
+            for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+        }
+
+        if config.trim_output {
+            for rec in &batch {
+                let (trimmed_seq, trimmed_qual, adapter_hit) =
+                    trim_record(&rec.seq, rec.qual.as_deref(), config);
+                if adapter_hit {
+                    trimmed_bases_removed += rec.seq.len() as u64 - trimmed_seq.len() as u64;
+                }
+                if trimmed_seq.len() as u64 >= config.min_length {
+                    if adapter_hit { trimmed_reads += 1; }
+                    if let Some(ref mut w) = trim_writer {
+                        if let Err(e) = io::write_fastq_record(w, &rec.id, trimmed_seq, trimmed_qual) {
+                            state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
+                        }
+                    }
+                }
+            }
+        }
+
+        read_count    += acc.read_count;
+        total_bases   += acc.total_bases;
+        gc_count      += acc.gc_count;
+        quality_sum   += acc.quality_sum;
+        quality_bases += acc.quality_bases;
+        q20_bases     += acc.q20_bases;
+        q30_bases     += acc.q30_bases;
+        adapter_hits  += acc.adapter_hits;
+        if acc.min_length < min_length { min_length = acc.min_length; }
+        if acc.max_length > max_length { max_length = acc.max_length; }
+        for (k, v) in acc.length_histogram { *length_histogram.entry(k).or_insert(0) += v; }
+        for i in 0..crate::types::MAX_QUAL_POSITION {
+            quality_by_pos[i].0 += acc.quality_by_pos[i].0;
+            quality_by_pos[i].1 += acc.quality_by_pos[i].1;
+            for j in 0..5 { base_composition[i][j] += acc.base_composition[i][j]; }
+        }
+        for i in 0..PHRED_BUCKETS { quality_distribution[i] += acc.quality_distribution[i]; }
+        for (k, v) in acc.per_tile { let e = per_tile.entry(k).or_insert((0,0)); e.0+=v.0; e.1+=v.1; }
+
+        flush_counter += acc.read_count;
+        if flush_counter >= FLUSH_INTERVAL {
+            flush_counter = 0;
+            total_flushed += FLUSH_INTERVAL;
+            let mut s = state.lock().unwrap();
+            if let Some(ref mut cur) = s.current {
+                cur.read_count        = read_count;
+                cur.total_bases       = total_bases;
+                cur.gc_count          = gc_count;
+                cur.quality_sum       = quality_sum;
+                cur.quality_bases     = quality_bases;
+                cur.q20_bases         = q20_bases;
+                cur.q30_bases         = q30_bases;
+                cur.adapter_hits      = adapter_hits;
+                cur.min_length        = min_length;
+                cur.max_length        = max_length;
+                cur.bytes_processed   = bytes.min(file_size);
+            }
+            if total_flushed % 500_000 == 0 {
+                let elapsed = s.elapsed_secs();
+                let rps  = if elapsed > 0.0 { read_count as f64 / elapsed } else { 0.0 };
+                let mbps = if elapsed > 0.0 { bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
+                s.log(LogLevel::Info, format!(
+                    "{} reads  {:.0} reads/s  {:.1} MB/s",
+                    format_number(read_count), rps, mbps,
+                ));
+            }
+        }
+    }
+
+    drop(trim_writer);
+
+    let dup_rate = if read_count > 0 {
+        (1.0 - (hll.len() / read_count as f64).min(1.0)) * 100.0
+    } else { 0.0 };
+
+    let mut s = state.lock().unwrap();
+    if let Some(ref mut cur) = s.current {
+        cur.read_count            = read_count;
+        cur.total_bases           = total_bases;
+        cur.gc_count              = gc_count;
+        cur.quality_sum           = quality_sum;
+        cur.quality_bases         = quality_bases;
+        cur.q20_bases             = q20_bases;
+        cur.q30_bases             = q30_bases;
+        cur.adapter_hits          = adapter_hits;
+        cur.trimmed_reads         = trimmed_reads;
+        cur.trimmed_bases_removed = trimmed_bases_removed;
+        cur.min_length            = min_length;
+        cur.max_length            = max_length;
+        cur.bytes_processed       = file_size;
+        cur.length_histogram      = length_histogram;
+        cur.quality_by_position   = quality_by_pos;
+        cur.kmer_counts           = kmer_total;
+        cur.dup_rate_pct          = dup_rate;
+        cur.per_tile_quality      = per_tile;
+        cur.base_composition      = base_composition;
+        cur.quality_distribution  = quality_distribution;
+    }
+
+    let elapsed = s.elapsed_secs();
+    let mbps = if elapsed > 0.0 { bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
+    let gc_pct = if total_bases > 0 { gc_count as f64 / total_bases as f64 * 100.0 } else { 0.0 };
+    let avg_q  = if quality_bases > 0 { quality_sum as f64 / quality_bases as f64 } else { 0.0 };
+    let adapter_pct = if read_count > 0 { adapter_hits as f64 / read_count as f64 * 100.0 } else { 0.0 };
+
+    s.log(LogLevel::Success, format!(
+        "Done (mmap): {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup ~{:.1}% | {:.1} MB/s",
+        format_number(read_count), gc_pct, avg_q, adapter_pct, dup_rate, mbps,
     ));
 
     if let Some(done) = s.current.take() {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 use crate::types::PHRED_BUCKETS;
+use super::mmap_reader::{count_gc_simd, count_n_simd};
 
 use crate::types::MAX_QUAL_POSITION;
 
@@ -75,19 +76,23 @@ impl BatchAccum {
 
         if adapter_hit { self.adapter_hits += 1; }
 
-        // Base composition and GC
+        // GC count via SIMD (whole sequence, fast)
+        self.gc_count += count_gc_simd(seq);
+
+        // Per-base composition (up to MAX_QUAL_POSITION positions)
         let end = seq.len().min(MAX_QUAL_POSITION);
         for pos in 0..end {
-            let base = seq[pos];
-            let idx = match base {
+            let idx = match seq[pos] {
                 b'A' | b'a' => 0,
-                b'C' | b'c' => { self.gc_count += 1; 1 }
-                b'G' | b'g' => { self.gc_count += 1; 2 }
+                b'C' | b'c' => 1,
+                b'G' | b'g' => 2,
                 b'T' | b't' => 3,
-                _ => 4,
+                _           => 4,
             };
             self.base_composition[pos][idx] += 1;
         }
+        // N content tracked separately via SIMD for accuracy
+        let _ = count_n_simd(seq); // counted in base_composition[..][4] above
 
         // Quality
         if let Some(q) = qual {
