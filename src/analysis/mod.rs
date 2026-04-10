@@ -73,12 +73,12 @@ fn detect_adapter_source(seq: &[u8]) -> String {
 
 /// Finalize overrepresented sequence analysis from accumulated counts.
 fn finish_overrep(
-    map: HashMap<Vec<u8>, u64>,
+    map: HashMap<[u8; 50], u64>,
     sampled: usize,
 ) -> Vec<OverrepSeq> {
     if sampled == 0 { return Vec::new(); }
     let threshold = sampled as f64 * 0.001; // 0.1% of sampled reads
-    let mut sorted: Vec<(Vec<u8>, u64)> = map
+    let mut sorted: Vec<([u8; 50], u64)> = map
         .into_iter()
         .filter(|(_, c)| *c as f64 >= threshold)
         .collect();
@@ -86,11 +86,13 @@ fn finish_overrep(
     sorted.truncate(20);
     sorted
         .into_iter()
-        .map(|(seq, count)| {
+        .map(|(key, count)| {
+            // Trim trailing null bytes from the fixed-size key
+            let seq = &key[..key.iter().rposition(|&b| b != 0).map(|p| p + 1).unwrap_or(0)];
             let percentage = count as f64 / sampled as f64 * 100.0;
-            let possible_source = detect_adapter_source(&seq);
+            let possible_source = detect_adapter_source(seq);
             OverrepSeq {
-                sequence: String::from_utf8_lossy(&seq).into_owned(),
+                sequence: String::from_utf8_lossy(seq).into_owned(),
                 count,
                 percentage,
                 possible_source,
@@ -318,7 +320,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
     let mut dup_sampled = 0usize;
     // Overrepresented sequences: first 50bp of first OVERREP_SAMPLE reads
-    let mut overrep_map: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
@@ -395,7 +397,10 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         if !acc.kmer_seqs.is_empty() {
             for seq in &acc.kmer_seqs {
                 if overrep_sampled < OVERREP_SAMPLE {
-                    *overrep_map.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    let mut key = [0u8; 50];
+                    let n = seq.len().min(50);
+                    key[..n].copy_from_slice(&seq[..n]);
+                    *overrep_map.entry(key).or_insert(0) += 1;
                     overrep_sampled += 1;
                 }
             }
@@ -604,7 +609,7 @@ fn process_single_file_mmap(
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
     let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
     let mut dup_sampled = 0usize;
-    let mut overrep_map: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
     let mut flush_counter     = 0u64;
     let mut total_flushed     = 0u64;
@@ -674,7 +679,10 @@ fn process_single_file_mmap(
         if !acc.kmer_seqs.is_empty() {
             for seq in &acc.kmer_seqs {
                 if overrep_sampled < OVERREP_SAMPLE {
-                    *overrep_map.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    let mut key = [0u8; 50];
+                    let n = seq.len().min(50);
+                    key[..n].copy_from_slice(&seq[..n]);
+                    *overrep_map.entry(key).or_insert(0) += 1;
                     overrep_sampled += 1;
                 }
             }
@@ -881,7 +889,7 @@ fn process_paired_files(
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
     let mut dup_map_pe: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
     let mut dup_sampled_pe = 0usize;
-    let mut overrep_map_pe: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_map_pe: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled_pe = 0usize;
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
@@ -957,7 +965,10 @@ fn process_paired_files(
         if !acc.kmer_seqs.is_empty() {
             for seq in &acc.kmer_seqs {
                 if overrep_sampled_pe < OVERREP_SAMPLE {
-                    *overrep_map_pe.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    let mut key = [0u8; 50];
+                    let n = seq.len().min(50);
+                    key[..n].copy_from_slice(&seq[..n]);
+                    *overrep_map_pe.entry(key).or_insert(0) += 1;
                     overrep_sampled_pe += 1;
                 }
             }
