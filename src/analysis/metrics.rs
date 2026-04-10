@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 use crate::types::PHRED_BUCKETS;
-use super::mmap_reader::{count_gc_simd, count_n_simd};
+use super::mmap_reader::count_gc_simd;
 
 use crate::types::MAX_QUAL_POSITION;
 
@@ -70,9 +70,12 @@ impl BatchAccum {
 
         let len = seq.len() as u64;
         self.total_bases += len;
-        if len < self.min_length { self.min_length = len; }
-        if len > self.max_length { self.max_length = len; }
-        *self.length_histogram.entry(len).or_insert(0) += 1;
+        // Only track length stats for non-empty reads (prevents min = 0 from parser edge cases)
+        if len > 0 {
+            if len < self.min_length { self.min_length = len; }
+            if len > self.max_length { self.max_length = len; }
+            *self.length_histogram.entry(len).or_insert(0) += 1;
+        }
 
         if adapter_hit { self.adapter_hits += 1; }
 
@@ -91,8 +94,7 @@ impl BatchAccum {
             };
             self.base_composition[pos][idx] += 1;
         }
-        // N content tracked separately via SIMD for accuracy
-        let _ = count_n_simd(seq); // counted in base_composition[..][4] above
+        // N content is tracked in base_composition[..][4] (index 4 = 'N' bucket above)
 
         // Quality
         if let Some(q) = qual {

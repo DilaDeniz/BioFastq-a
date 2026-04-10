@@ -1,6 +1,6 @@
 [package]
 name = "biofastq-a"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
 description = "BioFastq-A - High-performance FASTQ/FASTA quality analysis with HTML reports"
 

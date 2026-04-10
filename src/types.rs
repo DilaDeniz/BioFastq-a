@@ -7,6 +7,8 @@ pub const PARALLEL_BATCH: usize  = 20_000;
 pub const MAX_LOG_ENTRIES: usize = 1_000;
 /// Phred scores range 0–42; index directly into a 43-element array.
 pub const PHRED_BUCKETS: usize   = 43;
+/// Number of reads sampled for overrepresented sequence and duplication analysis.
+pub const OVERREP_SAMPLE: usize  = 200_000;
 
 // Adapter sequences to check (name, sequence prefix to match)
 pub const ADAPTERS: &[(&str, &[u8])] = &[
@@ -42,6 +44,35 @@ pub struct LogEntry {
     pub timestamp: Duration,
     pub level: LogLevel,
     pub message: String,
+}
+
+// ---------------------------------------------------------------------------
+// QC module pass/warn/fail status — mirrors FastQC's per-module traffic lights
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum QcStatus { Pass, Warn, Fail }
+
+impl QcStatus {
+    pub fn css_class(&self) -> &'static str {
+        match self { QcStatus::Pass => "pass", QcStatus::Warn => "warn", QcStatus::Fail => "fail" }
+    }
+    pub fn icon(&self) -> &'static str {
+        match self { QcStatus::Pass => "✓", QcStatus::Warn => "!", QcStatus::Fail => "✗" }
+    }
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self { QcStatus::Pass => "PASS", QcStatus::Warn => "WARN", QcStatus::Fail => "FAIL" }
+    }
+}
+
+/// A single overrepresented sequence found in the sample.
+#[derive(Clone)]
+pub struct OverrepSeq {
+    pub sequence: String,
+    pub count: u64,
+    pub percentage: f64,
+    pub possible_source: String,
 }
 
 /// Configuration passed to the processing engine.
@@ -117,8 +148,10 @@ pub struct FileStats {
     pub base_composition: Vec<[u64; 5]>,
     // Quality score distribution: count of reads per mean Phred score (index = floor(phred))
     pub quality_distribution: Vec<u64>,
-    // N content per position: count of N bases per position
-    // (derived from base_composition but stored for convenience)
+    // Overrepresented sequences (sampled from first OVERREP_SAMPLE reads)
+    pub overrepresented_sequences: Vec<OverrepSeq>,
+    // Per-module QC pass/warn/fail status (FastQC-style traffic lights)
+    pub module_status: Vec<(String, QcStatus)>,
 }
 
 impl FileStats {
@@ -147,6 +180,8 @@ impl FileStats {
             per_tile_quality: HashMap::new(),
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
             quality_distribution: vec![0u64; PHRED_BUCKETS],
+            overrepresented_sequences: Vec::new(),
+            module_status: Vec::new(),
         }
     }
 

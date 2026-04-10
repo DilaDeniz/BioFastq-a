@@ -123,6 +123,7 @@ pub fn count_gc_simd(seq: &[u8]) -> u64 {
 
 /// Count N bases.
 #[inline]
+#[allow(dead_code)]
 pub fn count_n_simd(seq: &[u8]) -> u64 {
     memchr::memchr_iter(b'N', seq).count() as u64
 }

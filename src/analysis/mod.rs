@@ -11,14 +11,14 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crossbeam_channel;
-use hyperloglog::HyperLogLog as Hll;
 use needletail::parse_fastx_file;
 use needletail::Sequence;
 use rayon::prelude::*;
 
 use crate::types::{
-    format_number, FileStats, LogLevel, ProcessConfig, ProcessingStatus, SharedState,
-    FLUSH_INTERVAL, PARALLEL_BATCH, PHRED_BUCKETS,
+    format_number, FileStats, LogLevel, OverrepSeq, ProcessConfig, ProcessingStatus,
+    QcStatus, SharedState, ADAPTER_MATCH_LEN, ADAPTERS, FLUSH_INTERVAL, OVERREP_SAMPLE,
+    PARALLEL_BATCH, PHRED_BUCKETS,
 };
 
 use self::io::{open_writer, write_fastq_record};
@@ -54,6 +54,107 @@ fn trim_record<'a>(
         Some(pos) => (&seq[..pos], qual.map(|q| &q[..pos.min(q.len())]), true),
         None => (seq, qual, false),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Overrepresented sequence + module status helpers
+// ---------------------------------------------------------------------------
+
+/// Check a sequence against known adapter prefixes and return the source name.
+fn detect_adapter_source(seq: &[u8]) -> String {
+    for (name, adapter) in ADAPTERS {
+        let n = adapter.len().min(ADAPTER_MATCH_LEN);
+        if seq.windows(n).any(|w| w == &adapter[..n]) {
+            return name.to_string();
+        }
+    }
+    "No hit".to_string()
+}
+
+/// Finalize overrepresented sequence analysis from accumulated counts.
+fn finish_overrep(
+    map: HashMap<Vec<u8>, u64>,
+    sampled: usize,
+) -> Vec<OverrepSeq> {
+    if sampled == 0 { return Vec::new(); }
+    let threshold = sampled as f64 * 0.001; // 0.1% of sampled reads
+    let mut sorted: Vec<(Vec<u8>, u64)> = map
+        .into_iter()
+        .filter(|(_, c)| *c as f64 >= threshold)
+        .collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.truncate(20);
+    sorted
+        .into_iter()
+        .map(|(seq, count)| {
+            let percentage = count as f64 / sampled as f64 * 100.0;
+            let possible_source = detect_adapter_source(&seq);
+            OverrepSeq {
+                sequence: String::from_utf8_lossy(&seq).into_owned(),
+                count,
+                percentage,
+                possible_source,
+            }
+        })
+        .collect()
+}
+
+/// Compute FastQC-style per-module pass/warn/fail from finished FileStats.
+fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
+    let mut m = Vec::with_capacity(8);
+
+    // Per-base sequence quality — worst position average
+    let qual_per_pos = f.avg_qual_per_position();
+    let min_pos_q = qual_per_pos.iter().cloned().fold(f64::MAX, f64::min);
+    m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
+        else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+
+    // Per-sequence quality (Q30 %)
+    let q30 = f.q30_pct();
+    m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
+        else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+
+    // Per-base sequence content — check A/T balance and C/G balance
+    let bcomp = f.base_composition_pct();
+    let unbalanced = bcomp.iter().any(|p| {
+        (p[0] - p[3]).abs() > 10.0 || (p[1] - p[2]).abs() > 10.0  // |A-T| or |C-G| > 10%
+    });
+    let very_unbalanced = bcomp.iter().any(|p| {
+        (p[0] - p[3]).abs() > 20.0 || (p[1] - p[2]).abs() > 20.0
+    });
+    m.push(("Per-base sequence content".into(), if very_unbalanced { QcStatus::Fail }
+        else if unbalanced { QcStatus::Warn } else { QcStatus::Pass }));
+
+    // GC content
+    let gc = f.gc_content();
+    m.push(("GC content".into(), if (40.0..=60.0).contains(&gc) { QcStatus::Pass }
+        else if (30.0..=70.0).contains(&gc) { QcStatus::Warn } else { QcStatus::Fail }));
+
+    // N content — max N% at any position
+    let max_n_pct = bcomp.iter().map(|p| p[4]).fold(0.0_f64, f64::max);
+    m.push(("N content".into(), if max_n_pct < 5.0 { QcStatus::Pass }
+        else if max_n_pct < 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+
+    // Sequence length distribution
+    let len_range = f.max_length.saturating_sub(f.effective_min_length());
+    m.push(("Sequence length".into(), if len_range == 0 { QcStatus::Pass }
+        else if len_range < 50 { QcStatus::Warn } else { QcStatus::Pass }));
+
+    // Sequence duplication level
+    m.push(("Duplication level".into(), if f.dup_rate_pct < 20.0 { QcStatus::Pass }
+        else if f.dup_rate_pct < 50.0 { QcStatus::Warn } else { QcStatus::Fail }));
+
+    // Overrepresented sequences
+    let has_high_overrep = f.overrepresented_sequences.iter().any(|s| s.percentage >= 1.0);
+    m.push(("Overrepresented seqs".into(),
+        if f.overrepresented_sequences.is_empty() { QcStatus::Pass }
+        else if has_high_overrep { QcStatus::Fail } else { QcStatus::Warn }));
+
+    // Adapter content
+    m.push(("Adapter content".into(), if f.adapter_pct() < 5.0 { QcStatus::Pass }
+        else if f.adapter_pct() < 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+
+    m
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +314,12 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    // HyperLogLog: ~1% error rate, counts all reads, ~10 KB RAM
-    let mut hll = Hll::new(0.01);
+    // Deterministic dedup: exact count on first OVERREP_SAMPLE fingerprints
+    let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
+    let mut dup_sampled = 0usize;
+    // Overrepresented sequences: first 50bp of first OVERREP_SAMPLE reads
+    let mut overrep_map: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_sampled = 0usize;
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
     let mut error_occurred = false;
@@ -278,13 +383,22 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // --- Duplication estimation via HyperLogLog (all reads) ---
-        for fp in &acc.fingerprints {
-            hll.insert(fp);
+        // --- Deterministic dedup: exact count on first OVERREP_SAMPLE reads ---
+        for &fp in &acc.fingerprints {
+            if dup_sampled < OVERREP_SAMPLE {
+                *dup_map.entry(fp).or_insert(0) += 1;
+                dup_sampled += 1;
+            }
         }
 
-        // --- K-mer counting for this batch ---
+        // --- Overrepresented sequences + K-mer counting ---
         if !acc.kmer_seqs.is_empty() {
+            for seq in &acc.kmer_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    overrep_sampled += 1;
+                }
+            }
             let kmers = count_kmers_parallel(&acc.kmer_seqs);
             for (k, v) in kmers {
                 *kmer_total.entry(k).or_insert(0) += v;
@@ -378,10 +492,11 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
     drop(trim_writer);
 
-    let dup_rate = if read_count > 0 {
-        let unique = hll.len();
-        (1.0 - (unique / read_count as f64).min(1.0)) * 100.0
-    } else { 0.0 };
+    // Deterministic dup rate: count reads whose fingerprint appeared >1 time in sample
+    let dup_count: u64 = dup_map.values().map(|&c| if c > 1 { (c - 1) as u64 } else { 0 }).sum();
+    let dup_rate = if dup_sampled > 0 { dup_count as f64 / dup_sampled as f64 * 100.0 } else { 0.0 };
+
+    let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
 
     let mut s = state.lock().unwrap();
     if let Some(ref mut cur) = s.current {
@@ -405,6 +520,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
+        cur.overrepresented_sequences = overrep_seqs;
+        cur.module_status = compute_module_status(cur);
     }
 
     let elapsed = s.elapsed_secs();
@@ -419,7 +536,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let tile_note = if tile_count > 0 { format!(" | {} tiles", tile_count) } else { String::new() };
 
     s.log(LogLevel::Success, format!(
-        "Done: {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup ~{:.1}% | {:.1} MB/s{}{}",
+        "Done: {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup {:.1}% | {:.1} MB/s{}{}",
         format_number(read_count), gc_pct, avg_q, adapter_pct, dup_rate, mbps, trim_note, tile_note,
     ));
 
@@ -485,7 +602,10 @@ fn process_single_file_mmap(
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
-    let mut hll               = Hll::new(0.01);
+    let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
+    let mut dup_sampled = 0usize;
+    let mut overrep_map: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_sampled = 0usize;
     let mut flush_counter     = 0u64;
     let mut total_flushed     = 0u64;
 
@@ -545,8 +665,19 @@ fn process_single_file_mmap(
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        for fp in &acc.fingerprints { hll.insert(fp); }
+        for &fp in &acc.fingerprints {
+            if dup_sampled < OVERREP_SAMPLE {
+                *dup_map.entry(fp).or_insert(0) += 1;
+                dup_sampled += 1;
+            }
+        }
         if !acc.kmer_seqs.is_empty() {
+            for seq in &acc.kmer_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    overrep_sampled += 1;
+                }
+            }
             let kmers = count_kmers_parallel(&acc.kmer_seqs);
             for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
         }
@@ -624,9 +755,10 @@ fn process_single_file_mmap(
     producer.join().expect("reader thread panicked");
     drop(trim_writer);
 
-    let dup_rate = if read_count > 0 {
-        (1.0 - (hll.len() / read_count as f64).min(1.0)) * 100.0
-    } else { 0.0 };
+    let dup_count: u64 = dup_map.values().map(|&c| if c > 1 { (c - 1) as u64 } else { 0 }).sum();
+    let dup_rate = if dup_sampled > 0 { dup_count as f64 / dup_sampled as f64 * 100.0 } else { 0.0 };
+
+    let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
 
     let mut s = state.lock().unwrap();
     if let Some(ref mut cur) = s.current {
@@ -650,6 +782,8 @@ fn process_single_file_mmap(
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
+        cur.overrepresented_sequences = overrep_seqs;
+        cur.module_status = compute_module_status(cur);
     }
 
     let elapsed = s.elapsed_secs();
@@ -659,7 +793,7 @@ fn process_single_file_mmap(
     let adapter_pct = if read_count > 0 { adapter_hits as f64 / read_count as f64 * 100.0 } else { 0.0 };
 
     s.log(LogLevel::Success, format!(
-        "Done (mmap): {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup ~{:.1}% | {:.1} MB/s",
+        "Done: {} reads | GC {:.1}% | Q{:.1} | {:.2}% adapter | dup {:.1}% | {:.1} MB/s",
         format_number(read_count), gc_pct, avg_q, adapter_pct, dup_rate, mbps,
     ));
 
@@ -745,7 +879,10 @@ fn process_paired_files(
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
-    let mut hll = Hll::new(0.01);
+    let mut dup_map_pe: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
+    let mut dup_sampled_pe = 0usize;
+    let mut overrep_map_pe: HashMap<Vec<u8>, u64> = HashMap::with_capacity(4096);
+    let mut overrep_sampled_pe = 0usize;
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
 
@@ -810,9 +947,20 @@ fn process_paired_files(
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // Merge accumulators
-        for fp in &acc.fingerprints { hll.insert(fp); }
+        // Dedup + overrep
+        for &fp in &acc.fingerprints {
+            if dup_sampled_pe < OVERREP_SAMPLE {
+                *dup_map_pe.entry(fp).or_insert(0) += 1;
+                dup_sampled_pe += 1;
+            }
+        }
         if !acc.kmer_seqs.is_empty() {
+            for seq in &acc.kmer_seqs {
+                if overrep_sampled_pe < OVERREP_SAMPLE {
+                    *overrep_map_pe.entry(seq[..seq.len().min(50)].to_vec()).or_insert(0) += 1;
+                    overrep_sampled_pe += 1;
+                }
+            }
             let kmers = count_kmers_parallel(&acc.kmer_seqs);
             for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
         }
@@ -862,9 +1010,9 @@ fn process_paired_files(
         }
     }
 
-    let dup_rate = if read_count > 0 {
-        (1.0 - (hll.len() / read_count as f64).min(1.0)) * 100.0
-    } else { 0.0 };
+    let dup_pe_count: u64 = dup_map_pe.values().map(|&c| if c > 1 { (c-1) as u64 } else { 0 }).sum();
+    let dup_rate = if dup_sampled_pe > 0 { dup_pe_count as f64 / dup_sampled_pe as f64 * 100.0 } else { 0.0 };
+    let overrep_seqs_pe = finish_overrep(overrep_map_pe, overrep_sampled_pe);
 
     let mut s = state.lock().unwrap();
     if let Some(ref mut cur) = s.current {
@@ -886,6 +1034,8 @@ fn process_paired_files(
         cur.per_tile_quality = per_tile;
         cur.base_composition = base_composition;
         cur.quality_distribution = quality_distribution;
+        cur.overrepresented_sequences = overrep_seqs_pe;
+        cur.module_status = compute_module_status(cur);
     }
 
     let elapsed = s.elapsed_secs();
@@ -895,7 +1045,7 @@ fn process_paired_files(
     let avg_q = if quality_bases > 0 { quality_sum as f64 / quality_bases as f64 } else { 0.0 };
 
     s.log(LogLevel::Success, format!(
-        "Done: {} pairs | GC {:.1}% | Q{:.1} | dup ~{:.1}% | {:.1} MB/s",
+        "Done: {} pairs | GC {:.1}% | Q{:.1} | dup {:.1}% | {:.1} MB/s",
         format_number(pairs), gc_pct, avg_q, dup_rate, mbps,
     ));
 
