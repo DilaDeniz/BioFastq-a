@@ -16,7 +16,7 @@ No Java. No Python. No internet required.
 
 ## Benchmark
 
-Real Illumina data — **SRR38033288** (43.5M reads · 6 Gb · 4 threads · cold cache · WSL2)
+Real Illumina data — **SRR38033288** (43.5M reads · 6.08 Gbp · ~14 GB on disk · 4 threads · cold cache · WSL2)
 
 | Tool | Time | What it does |
 |---|---|---|
@@ -200,7 +200,7 @@ Add custom adapters with `--adapter SEQUENCE` (repeatable).
 | | BioFastq-A | FastQC |
 |---|---|---|
 | Language | Rust | Java |
-| Speed (real data) | **33s** / 6 Gb | 168s / 6 Gb |
+| Speed (real data) | **33s** / 6.08 Gbp | 168s / 6.08 Gbp |
 | Interactive TUI | **Yes** | No |
 | Adapter trimming | **Yes** | No |
 | N50 / N90 | **Yes** | No |
