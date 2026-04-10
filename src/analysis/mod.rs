@@ -618,9 +618,10 @@ fn process_single_file_mmap(
     // consumer (main thread).  Both deref to &[u8] for zero-copy access.
     let mmap_arc = mmap_reader.mmap_arc();
 
-    // Bounded channel: up to 4 batches in flight so the producer stays ahead
-    // without unbounded memory growth.
-    let (tx, rx) = crossbeam_channel::bounded::<(Vec<RecordRange>, u64)>(4);
+    // Bounded channel: 8 batches in flight.  Wider buffer means the producer
+    // thread rarely stalls waiting for the consumer — better I/O / compute
+    // overlap on NVMe or fast HDDs where seeks are cheap.
+    let (tx, rx) = crossbeam_channel::bounded::<(Vec<RecordRange>, u64)>(8);
 
     // --- Producer thread: reads RecordRange batches, no data copies ---
     let producer = thread::spawn(move || {

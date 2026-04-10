@@ -2,8 +2,12 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MAX_QUAL_POSITION: usize = 500;
-pub const FLUSH_INTERVAL: u64    = 50_000;
-pub const PARALLEL_BATCH: usize  = 20_000;
+/// How often (in reads) the UI stats panel is refreshed.  Larger = less lock
+/// contention; 100k gives ~1-2 s refresh granularity at 50–100k reads/s.
+pub const FLUSH_INTERVAL: u64    = 100_000;
+/// Records per rayon fold batch.  50k reduces task-dispatch overhead vs 20k
+/// while keeping memory bounded (~10 MB per batch at 200 B/record).
+pub const PARALLEL_BATCH: usize  = 50_000;
 pub const MAX_LOG_ENTRIES: usize = 1_000;
 /// Phred scores range 0–42; index directly into a 43-element array.
 pub const PHRED_BUCKETS: usize   = 43;
