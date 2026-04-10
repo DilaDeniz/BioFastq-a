@@ -632,7 +632,9 @@ fn process_single_file_mmap(
                 match mmap_reader.next_range() {
                     None => break,
                     Some(range) => {
-                        batch_bytes += range.seq_len as u64 + range.id_len as u64 + 4;
+                        // '@' + id + '\n' + seq + '\n' + "+\n" + qual + '\n' = +6 overhead
+                        batch_bytes += range.id_len as u64 + range.seq_len as u64
+                            + range.qual_len as u64 + 6;
                         batch.push(range);
                     }
                 }
