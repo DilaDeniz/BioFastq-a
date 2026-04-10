@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/logo.png" width="160" alt="BioFastq-A logo"/>
+<img src="logo.png" width="160" alt="BioFastq-A logo"/>
 
 # BioFastq-A
 
