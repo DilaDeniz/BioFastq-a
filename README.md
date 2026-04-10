@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/logo.png" width="160" alt="BioFastq-A logo"/>
+
 # BioFastq-A
 
 **High-performance FASTQ/FASTA quality analysis — written in Rust**
