@@ -8,7 +8,9 @@ mod mmap_reader;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::thread;
 
+use crossbeam_channel;
 use hyperloglog::HyperLogLog as Hll;
 use needletail::parse_fastx_file;
 use needletail::Sequence;
@@ -22,6 +24,7 @@ use crate::types::{
 use self::io::{open_writer, write_fastq_record};
 use self::kmers::count_kmers_parallel;
 use self::metrics::{fingerprint, BatchAccum};
+use self::mmap_reader::RecordRange;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -427,6 +430,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
 // ---------------------------------------------------------------------------
 // mmap-based zero-copy processing for plain FASTQ files
+// Pipeline: dedicated reader thread fills a bounded channel while the main
+// thread drains it with rayon — I/O and compute overlap fully.
 // ---------------------------------------------------------------------------
 
 fn process_single_file_mmap(
@@ -484,34 +489,51 @@ fn process_single_file_mmap(
     let mut flush_counter     = 0u64;
     let mut total_flushed     = 0u64;
 
-    // Batch: collect owned records then process in parallel
-    loop {
-        let mut batch: Vec<OwnedRecord> = Vec::with_capacity(PARALLEL_BATCH);
-        let mut batch_bytes = 0u64;
+    // Arc<Mmap> shared between the producer thread (via MmapFastq) and the
+    // consumer (main thread).  Both deref to &[u8] for zero-copy access.
+    let mmap_arc = mmap_reader.mmap_arc();
 
-        while batch.len() < PARALLEL_BATCH {
-            match mmap_reader.next_record() {
-                None => break,
-                Some(rec) => {
-                    batch_bytes += rec.seq.len() as u64 + rec.id.len() as u64 + 4;
-                    batch.push(OwnedRecord {
-                        id:   rec.id.to_vec(),
-                        seq:  rec.seq.to_vec(),
-                        qual: Some(rec.qual.to_vec()),
-                    });
+    // Bounded channel: up to 4 batches in flight so the producer stays ahead
+    // without unbounded memory growth.
+    let (tx, rx) = crossbeam_channel::bounded::<(Vec<RecordRange>, u64)>(4);
+
+    // --- Producer thread: reads RecordRange batches, no data copies ---
+    let producer = thread::spawn(move || {
+        loop {
+            let mut batch: Vec<RecordRange> = Vec::with_capacity(PARALLEL_BATCH);
+            let mut batch_bytes = 0u64;
+            while batch.len() < PARALLEL_BATCH {
+                match mmap_reader.next_range() {
+                    None => break,
+                    Some(range) => {
+                        batch_bytes += range.seq_len as u64 + range.id_len as u64 + 4;
+                        batch.push(range);
+                    }
                 }
             }
+            if batch.is_empty() { break; }
+            if tx.send((batch, batch_bytes)).is_err() { break; }
         }
+        // tx dropped here signals end-of-stream to the consumer
+    });
 
-        if batch.is_empty() { break; }
+    // --- Consumer: receive batches, process with rayon while producer reads ahead ---
+    // Deref Arc<Mmap> → &[u8] once; safe to share across all rayon workers
+    // because Mmap is Sync and outlives all rayon fold calls below.
+    let mmap_bytes: &[u8] = &**mmap_arc;
+
+    while let Ok((batch, batch_bytes)) = rx.recv() {
         bytes += batch_bytes;
 
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, |mut acc, rec| {
+            .fold(BatchAccum::default, |mut acc, range| {
+                let id   = range.id(mmap_bytes);
+                let seq  = range.seq(mmap_bytes);
+                let qual = range.qual(mmap_bytes);
                 let (eff_seq, eff_qual, adapter_hit) =
-                    trim_record(&rec.seq, rec.qual.as_deref(), config);
-                let tile_info = parse_illumina_tile(&rec.id).and_then(|tile_id| {
+                    trim_record(seq, Some(qual), config);
+                let tile_info = parse_illumina_tile(id).and_then(|tile_id| {
                     eff_qual.map(|q| {
                         let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
                         (tile_id, phred_sum, q.len() as u64)
@@ -530,16 +552,19 @@ fn process_single_file_mmap(
         }
 
         if config.trim_output {
-            for rec in &batch {
+            for range in &batch {
+                let seq  = range.seq(mmap_bytes);
+                let id   = range.id(mmap_bytes);
+                let qual = range.qual(mmap_bytes);
                 let (trimmed_seq, trimmed_qual, adapter_hit) =
-                    trim_record(&rec.seq, rec.qual.as_deref(), config);
+                    trim_record(seq, Some(qual), config);
                 if adapter_hit {
-                    trimmed_bases_removed += rec.seq.len() as u64 - trimmed_seq.len() as u64;
+                    trimmed_bases_removed += seq.len() as u64 - trimmed_seq.len() as u64;
                 }
                 if trimmed_seq.len() as u64 >= config.min_length {
                     if adapter_hit { trimmed_reads += 1; }
                     if let Some(ref mut w) = trim_writer {
-                        if let Err(e) = io::write_fastq_record(w, &rec.id, trimmed_seq, trimmed_qual) {
+                        if let Err(e) = io::write_fastq_record(w, id, trimmed_seq, trimmed_qual) {
                             state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
                         }
                     }
@@ -596,6 +621,7 @@ fn process_single_file_mmap(
         }
     }
 
+    producer.join().expect("reader thread panicked");
     drop(trim_writer);
 
     let dup_rate = if read_count > 0 {

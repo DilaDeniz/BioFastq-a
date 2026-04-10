@@ -18,6 +18,7 @@ aho-corasick = "1"                # multi-pattern adapter matching
 xxhash-rust = { version = "0.8", features = ["xxh3"] }  # fast non-crypto hash
 memchr = "2"                      # SIMD-accelerated byte searching
 memmap2 = "0.9"                   # memory-mapped file I/O
+crossbeam-channel = "0.5"         # lock-free MPSC channel for I/O+compute pipeline
 
 [dev-dependencies]
 tempfile = "3"
