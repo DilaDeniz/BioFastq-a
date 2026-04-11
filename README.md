@@ -1,38 +1,60 @@
+<div align="center">
+
+<img src="logo.png" width="160" alt="BioFastq-A logo"/>
+
 # BioFastq-A
 
-**High-performance FASTQ/FASTA quality analysis** — written in Rust.
+**High-performance FASTQ/FASTA quality analysis — written in Rust**
 
-Parallel k-mer counting, per-base quality charts, adapter trimming, duplication
-estimation, per-tile Illumina QC, N50/N90 for long reads, and a self-contained
-HTML report that opens in any browser. No Java. No Python. No internet required.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
+[![Version](https://img.shields.io/badge/version-2.2.0-blue.svg)](Cargo.toml)
+
+No Java. No Python. No internet required.
+
+</div>
+
+---
+
+## Benchmark
+
+Real Illumina data — **SRR38033288** (43.5M reads · 6.08 Gbp · ~14 GB on disk · 4 threads · cold cache · WSL2)
+
+| Tool | Time | What it does |
+|---|---|---|
+| **BioFastq-A** | **33s** | overrep seqs · k-mers · dup · per-tile · N50/N90 · HTML report |
+| fastp | 58s | adapter trimming · QC · k-mers |
+| FastQC | 168s | similar analysis depth to BioFastq-A |
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Build (one-time, ~20 s)
+# Build (one-time, ~20s)
 cargo build --release
 
-# 2. Analyse a file — opens the live TUI dashboard
+# Interactive TUI — live dashboard while processing
 ./target/release/biofastq-a sample.fastq
 
-# 3. Headless (CI / scripts)
-./target/release/biofastq-a sample.fastq.gz --headless --output-dir ./reports
+# Headless — for scripts and CI
+./target/release/biofastq-a sample.fastq --headless --output-dir ./reports
 
-# 4. Trim adapters + analyse
+# Trim adapters + analyse
 ./target/release/biofastq-a reads.fastq --trim --output-dir ./qc
 
-# 5. Open the report
+# Open the report
+xdg-open ./reports/sample_report.html   # Linux
 open ./reports/sample_report.html       # macOS
-xdg-open ./reports/sample_report.html  # Linux
+explorer.exe ./reports/sample_report.html  # WSL
 ```
 
 ---
 
 ## Installation
 
-### Option 1 — Build from source (recommended)
+<details>
+<summary><b>Build from source (recommended)</b></summary>
 
 Requires [Rust ≥ 1.80](https://rustup.rs).
 
@@ -40,17 +62,29 @@ Requires [Rust ≥ 1.80](https://rustup.rs).
 git clone https://github.com/DilaDeniz/BioFastq-a.git
 cd BioFastq-a
 cargo build --release
-# binary is at target/release/biofastq-a
+# binary → target/release/biofastq-a
+```
+
+Enable native CPU optimisations (AVX2/SSE4 — recommended):
+
+```bash
+mkdir -p .cargo
+echo '[build]' > .cargo/config.toml
+echo 'rustflags = ["-C", "target-cpu=native"]' >> .cargo/config.toml
+cargo build --release
 ```
 
 Install system-wide:
 
 ```bash
-bash install.sh          # installs to /usr/local/bin  (may need sudo)
-bash install.sh ~/bin    # installs to ~/bin (no sudo needed)
+bash install.sh          # → /usr/local/bin (may need sudo)
+bash install.sh ~/bin    # → ~/bin (no sudo)
 ```
 
-### Option 2 — Docker
+</details>
+
+<details>
+<summary><b>Docker</b></summary>
 
 ```bash
 docker build -t biofastq-a .
@@ -60,49 +94,17 @@ docker run --rm -v "$PWD":/data biofastq-a sample.fastq --headless
 docker run --rm -v "$PWD":/data biofastq-a *.fastq.gz --trim --output-dir /data/qc
 ```
 
-### Option 3 — Homebrew (macOS / Linux)
+</details>
+
+<details>
+<summary><b>Homebrew (macOS / Linux)</b></summary>
 
 ```bash
 brew tap DilaDeniz/biofastq-a
 brew install biofastq-a
 ```
 
-> The tap formula is in `Formula/biofastq-a.rb`.
-
----
-
-## How to open the app
-
-**Interactive TUI dashboard** (default):
-
-```bash
-biofastq-a sample.fastq
-```
-
-This opens a live terminal dashboard that updates in real time.
-Press **Q** or **Esc** to exit. Reports are written automatically when
-processing completes.
-
-**Headless / batch mode** (no terminal UI):
-
-```bash
-biofastq-a sample.fastq --headless
-```
-
-Use this in shell scripts, Snakemake, or Nextflow pipelines.
-
-**View the HTML report** — open the generated `.html` file in any browser:
-
-```bash
-# macOS
-open sample_report.html
-
-# Linux
-xdg-open sample_report.html
-
-# Windows (WSL)
-explorer.exe sample_report.html
-```
+</details>
 
 ---
 
@@ -112,95 +114,61 @@ explorer.exe sample_report.html
 biofastq-a [OPTIONS] <file> [<file2> ...]
 
 OPTIONS:
-  --headless          No TUI — for scripts and CI
-  --output-dir <dir>  Where to write reports (default: current directory)
-  --trim              Trim adapters; write <stem>_trimmed.fastq.gz
-  --min-length <N>    Drop trimmed reads shorter than N bp (default: 20)
-  --version, -V       Print version
-  --help, -h          Show help
+  --headless             No TUI — for scripts and CI
+  --output-dir <dir>     Where to write reports (default: current directory)
+  --trim                 Trim adapters; write <stem>_trimmed.fastq.gz
+  --min-length <N>       Drop trimmed reads shorter than N bp (default: 20)
+  --adapter <seq>        Additional adapter sequence to screen/trim (repeatable)
+  --quality-trim <Q>     Trim 3' bases with Phred quality below Q (default: off)
+  --threads <N>          Number of CPU threads (default: all cores)
+  --strict               Abort on first malformed record (default: skip & warn)
+  --paired-end <R2>      Paired-end mode: provide R2 file path
+  --version, -V          Print version
+  --help, -h             Show help
 ```
-
-### Multiple files
-
-```bash
-biofastq-a lane1.fastq lane2.fastq lane3.fastq --headless --output-dir ./qc
-```
-
-Each file gets its own section in the HTML report. A combined summary table
-is shown at the top.
 
 ---
 
 ## Features
 
-| Feature | Details |
+<details>
+<summary><b>QC Modules</b></summary>
+
+| Module | Details |
 |---|---|
-| **Per-base quality chart** | Phred quality plotted per position (up to 500 bp), with Q20/Q28/Q30 zone shading |
-| **Read length distribution** | Bar chart; works for short reads (Illumina) and long reads (Nanopore/PacBio) |
-| **N50 / N90** | Computed from the length histogram — no memory overhead |
-| **GC content** | Per-read and overall |
-| **Q20 / Q30 pass rates** | Fraction of reads with mean quality ≥ threshold |
-| **Adapter detection** | 7 common Illumina/Nextera/Poly-A sequences checked per read |
-| **Adapter trimming** | `--trim` hard-clips adapters; outputs gzipped FASTQ |
-| **Duplication estimate** | Fingerprint-hashes first 200k reads; reports % likely duplicates |
-| **Per-tile quality** | Parses Illumina CASAVA 1.8+ tile IDs from headers; bar chart per tile |
-| **Top 20 k-mers** | Parallel 4-mer counting using Rayon |
-| **HTML report** | Self-contained, offline-capable; three interactive Canvas charts |
-| **JSON report** | Machine-readable; suitable for downstream pipeline parsing |
-| **gzip support** | `.fastq.gz` / `.fasta.gz` read and written transparently |
-| **Multi-file batch** | Any number of input files in one run |
-| **Docker** | Multi-stage Dockerfile included |
-| **TUI dashboard** | Real-time progress, quality sparkline, 12-metric panel |
+| Per-base quality | Phred per position up to 500 bp · Q20/Q28/Q30 zone shading |
+| Per-sequence quality | Read-level mean Phred distribution |
+| Base composition | A/C/G/T/N % per position |
+| GC content | Overall + FastQC-style pass/warn/fail |
+| N content | N % per position |
+| Sequence length | Distribution chart · N50 · N90 |
+| Duplication | Fingerprint-hashes first 200k reads · deterministic |
+| Overrepresented seqs | Top sequences by frequency · adapter source detection |
+| Adapter content | 7 built-in sequences + custom via `--adapter` |
+| Per-tile quality | Illumina CASAVA 1.8+ tile IDs · bar chart per tile |
+| K-mer analysis | Parallel 4-mer counting · top enriched k-mers |
 
----
+Each module shows a **FastQC-style traffic light** (Pass / Warn / Fail).
 
-## Output files
+</details>
+
+<details>
+<summary><b>Output</b></summary>
 
 ```
-<stem>_report.html      — HTML report (open in browser)
-<stem>_report.json      — JSON report (for pipelines)
-<stem>_trimmed.fastq.gz — Trimmed reads (only with --trim)
+<stem>_report.html      — self-contained HTML report (offline, no CDN)
+<stem>_report.json      — machine-readable JSON for pipelines
+<stem>_trimmed.fastq.gz — trimmed reads (only with --trim)
 ```
 
-For multiple input files: `batch_report.html` / `batch_report.json`.
+For multiple input files: one report per file + `batch_report.html` summary.
 
----
+</details>
 
-## Performance
+<details>
+<summary><b>Adapters detected</b></summary>
 
-BioFastq-A uses Rayon parallel k-mer counting and processes all other metrics
-in a single streaming pass. Typical throughput on a modern desktop:
-
-| Dataset | Reads | Size | Time | Throughput |
-|---|---|---|---|---|
-| Illumina 150bp PE | 50M | 15 GB | ~45 s | ~340 MB/s |
-| Nanopore R10 | 5M | 30 GB | ~90 s | ~340 MB/s |
-
-*Measured on an 8-core machine with NVMe storage. Your results will vary.*
-
----
-
-## Comparison with FastQC
-
-| | BioFastq-A | FastQC |
-|---|---|---|
-| Language | Rust | Java |
-| Speed | ~340 MB/s | ~40 MB/s |
-| HTML report | Yes | Yes |
-| Adapter trimming | Yes (built-in) | No (needs Trimmomatic) |
-| Duplication estimate | Yes | Yes |
-| Per-tile quality | Yes | Yes |
-| N50 / N90 | Yes | No |
-| Long-read support | Yes | Limited |
-| Offline / no deps | Yes | Requires JVM |
-| Docker image | Yes | Official image |
-| gzip streaming | Yes | Yes |
-
----
-
-## Adapters detected
-
-| Name | Sequence (prefix checked) |
+| Name | Sequence (prefix matched) |
 |---|---|
 | TruSeq Read 1 | `AGATCGGAAGAGCACACGTCT` |
 | TruSeq Read 2 | `AGATCGGAAGAGCGTCGTGTA` |
@@ -209,11 +177,68 @@ in a single streaming pass. Typical throughput on a modern desktop:
 | Poly-A | `AAAAAAAAAAAAAAAAAAAAAA` |
 | Poly-T | `TTTTTTTTTTTTTTTTTTTTTT` |
 
+Add custom adapters with `--adapter SEQUENCE` (repeatable).
+
+</details>
+
+---
+
+## How it's fast
+
+- **mmap zero-copy reader** — sequence data never copied to heap
+- **RecordRange descriptors** — byte offsets into shared mmap, no allocations in hot path  
+- **crossbeam I/O pipeline** — reader thread and rayon workers run in parallel
+- **BASE_LUT** — 256-entry lookup table replaces 5-way branch per base
+- **AVX2 quality loops** — phred sum, Q20, Q30 as separate vectorised passes (32 bytes/cycle)
+- **K-mer sampling** — capped at first 200k reads, not the full file
+
+---
+
+## Comparison
+
+<details>
+<summary><b>vs FastQC</b></summary>
+
+| | BioFastq-A | FastQC |
+|---|---|---|
+| Language | Rust | Java |
+| Speed (real data) | **33s** / 6.08 Gbp | 168s / 6.08 Gbp |
+| Interactive TUI | **Yes** | No |
+| Adapter trimming | **Yes** | No |
+| N50 / N90 | **Yes** | No |
+| Long-read support | **Yes** | Limited |
+| Offline / no deps | **Yes** | Requires JVM |
+| HTML report | Yes | Yes |
+| Per-tile quality | Yes | Yes |
+| Duplication estimate | Yes | Yes |
+
+</details>
+
+<details>
+<summary><b>vs fastp</b></summary>
+
+| | BioFastq-A | fastp |
+|---|---|---|
+| Language | Rust | C++ |
+| Speed (real data) | **33s** / 6 Gb | 58s / 6 Gb |
+| Interactive TUI | **Yes** | No |
+| N50 / N90 | **Yes** | No |
+| Per-tile quality | **Yes** | No |
+| Overrepresented seqs | **Yes** | No |
+| FastQC traffic lights | **Yes** | No |
+| Multi-file batch | **Yes** | No |
+| Paired-end support | Yes | **Yes (default)** |
+| Auto adapter detection | No | **Yes** |
+| Poly-G tail trim | No | **Yes** |
+
+</details>
+
 ---
 
 ## Pipeline integration
 
-### Snakemake
+<details>
+<summary><b>Snakemake</b></summary>
 
 ```python
 rule fastq_qc:
@@ -225,7 +250,10 @@ rule fastq_qc:
         "biofastq-a {input} --headless --output-dir qc/"
 ```
 
-### Nextflow
+</details>
+
+<details>
+<summary><b>Nextflow</b></summary>
 
 ```groovy
 process BIOFASTQA {
@@ -238,11 +266,13 @@ process BIOFASTQA {
 }
 ```
 
+</details>
+
 ---
 
-## Sponsor with Crypto
+## Support
 
-If you find this project useful, consider sending a small tip. Due to age restrictions I'm unable to use traditional payment platforms, so crypto is the only way I can receive support — thank you!
+If you find this project useful, consider sending a small tip. Due to age restrictions I'm unable to use traditional payment platforms — crypto is the only way I can receive support. Thank you!
 
 | Network | Address |
 |---|---|

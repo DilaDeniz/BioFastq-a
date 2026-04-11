@@ -2,9 +2,17 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub const MAX_QUAL_POSITION: usize = 500;
-pub const FLUSH_INTERVAL: u64 = 10_000;
-pub const BATCH_SIZE: usize = 50_000;
-pub const MAX_LOG_ENTRIES: usize = 1000;
+/// How often (in reads) the UI stats panel is refreshed.  Larger = less lock
+/// contention; 100k gives ~1-2 s refresh granularity at 50–100k reads/s.
+pub const FLUSH_INTERVAL: u64    = 100_000;
+/// Records per rayon fold batch.  50k reduces task-dispatch overhead vs 20k
+/// while keeping memory bounded (~10 MB per batch at 200 B/record).
+pub const PARALLEL_BATCH: usize  = 50_000;
+pub const MAX_LOG_ENTRIES: usize = 1_000;
+/// Phred scores range 0–42; index directly into a 43-element array.
+pub const PHRED_BUCKETS: usize   = 43;
+/// Number of reads sampled for overrepresented sequence and duplication analysis.
+pub const OVERREP_SAMPLE: usize  = 200_000;
 
 // Adapter sequences to check (name, sequence prefix to match)
 pub const ADAPTERS: &[(&str, &[u8])] = &[
@@ -42,6 +50,35 @@ pub struct LogEntry {
     pub message: String,
 }
 
+// ---------------------------------------------------------------------------
+// QC module pass/warn/fail status — mirrors FastQC's per-module traffic lights
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, PartialEq, Debug)]
+pub enum QcStatus { Pass, Warn, Fail }
+
+impl QcStatus {
+    pub fn css_class(&self) -> &'static str {
+        match self { QcStatus::Pass => "pass", QcStatus::Warn => "warn", QcStatus::Fail => "fail" }
+    }
+    pub fn icon(&self) -> &'static str {
+        match self { QcStatus::Pass => "✓", QcStatus::Warn => "!", QcStatus::Fail => "✗" }
+    }
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self { QcStatus::Pass => "PASS", QcStatus::Warn => "WARN", QcStatus::Fail => "FAIL" }
+    }
+}
+
+/// A single overrepresented sequence found in the sample.
+#[derive(Clone)]
+pub struct OverrepSeq {
+    pub sequence: String,
+    pub count: u64,
+    pub percentage: f64,
+    pub possible_source: String,
+}
+
 /// Configuration passed to the processing engine.
 #[derive(Clone)]
 pub struct ProcessConfig {
@@ -51,6 +88,15 @@ pub struct ProcessConfig {
     pub min_length: u64,
     /// Directory for trimmed output files
     pub output_dir: String,
+    /// Additional custom adapter sequences to screen/trim (on top of built-ins)
+    pub custom_adapters: Vec<Vec<u8>>,
+    /// If > 0, quality-trim the 3' end: drop trailing bases with Phred < threshold
+    pub quality_trim_threshold: u8,
+    /// Abort on first malformed record instead of skipping it
+    pub strict: bool,
+    /// If set, treat input as paired-end: this is the R2 file path.
+    /// The primary input file is R1.
+    pub paired_end_r2: Option<String>,
 }
 
 impl Default for ProcessConfig {
@@ -59,12 +105,14 @@ impl Default for ProcessConfig {
             trim_output: false,
             min_length: 20,
             output_dir: ".".to_string(),
+            custom_adapters: Vec::new(),
+            quality_trim_threshold: 0,
+            strict: false,
+            paired_end_r2: None,
         }
     }
 }
 
-/// How many reads to sample for duplication estimation
-pub const DUP_SAMPLE_SIZE: usize = 200_000;
 
 /// Per-file statistics accumulated during analysis
 #[derive(Clone)]
@@ -78,8 +126,8 @@ pub struct FileStats {
     // Quality
     pub quality_sum: u64,
     pub quality_bases: u64,
-    pub q20_reads: u64,
-    pub q30_reads: u64,
+    pub q20_bases: u64,
+    pub q30_bases: u64,
     // k-mer
     pub kmer_counts: HashMap<[u8; 4], u64>,
     // Progress
@@ -96,10 +144,18 @@ pub struct FileStats {
     pub trimmed_reads: u64,
     pub trimmed_bases_removed: u64,
     pub trim_output_path: Option<String>,
-    // Duplication estimate (sampled from first DUP_SAMPLE_SIZE reads)
+    // Duplication estimate via HyperLogLog (all reads)
     pub dup_rate_pct: f64,
     // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
     pub per_tile_quality: HashMap<u32, (u64, u64)>,
+    // Per-base composition: [A, C, G, T, N] counts per position
+    pub base_composition: Vec<[u64; 5]>,
+    // Quality score distribution: count of reads per mean Phred score (index = floor(phred))
+    pub quality_distribution: Vec<u64>,
+    // Overrepresented sequences (sampled from first OVERREP_SAMPLE reads)
+    pub overrepresented_sequences: Vec<OverrepSeq>,
+    // Per-module QC pass/warn/fail status (FastQC-style traffic lights)
+    pub module_status: Vec<(String, QcStatus)>,
 }
 
 impl FileStats {
@@ -112,8 +168,8 @@ impl FileStats {
             gc_count: 0,
             quality_sum: 0,
             quality_bases: 0,
-            q20_reads: 0,
-            q30_reads: 0,
+            q20_bases: 0,
+            q30_bases: 0,
             kmer_counts: HashMap::new(),
             bytes_processed: 0,
             min_length: u64::MAX,
@@ -126,6 +182,10 @@ impl FileStats {
             trim_output_path: None,
             dup_rate_pct: 0.0,
             per_tile_quality: HashMap::new(),
+            base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
+            quality_distribution: vec![0u64; PHRED_BUCKETS],
+            overrepresented_sequences: Vec::new(),
+            module_status: Vec::new(),
         }
     }
 
@@ -158,17 +218,13 @@ impl FileStats {
     }
 
     pub fn q20_pct(&self) -> f64 {
-        if self.read_count == 0 {
-            return 0.0;
-        }
-        self.q20_reads as f64 / self.read_count as f64 * 100.0
+        if self.quality_bases == 0 { return 0.0; }
+        self.q20_bases as f64 / self.quality_bases as f64 * 100.0
     }
 
     pub fn q30_pct(&self) -> f64 {
-        if self.read_count == 0 {
-            return 0.0;
-        }
-        self.q30_reads as f64 / self.read_count as f64 * 100.0
+        if self.quality_bases == 0 { return 0.0; }
+        self.q30_bases as f64 / self.quality_bases as f64 * 100.0
     }
 
     /// Returns 0 if no reads have been seen yet (min_length is u64::MAX in that case)
@@ -196,7 +252,7 @@ impl FileStats {
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
         let n50_thresh = (self.total_bases + 1) / 2;
-        let n90_thresh = (self.total_bases as f64 * 0.9) as u64;
+        let n90_thresh = self.total_bases * 9 / 10;
 
         let mut cumsum = 0u64;
         let mut n50 = 0u64;
@@ -263,6 +319,44 @@ impl FileStats {
         v
     }
 
+    /// Per-base composition trimmed to last position with data.
+    /// Returns vec of (A%, C%, G%, T%, N%) per position.
+    pub fn base_composition_pct(&self) -> Vec<[f64; 5]> {
+        let last = self
+            .base_composition
+            .iter()
+            .rposition(|counts| counts.iter().any(|&c| c > 0))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        self.base_composition[..last]
+            .iter()
+            .map(|counts| {
+                let total: u64 = counts.iter().sum();
+                if total == 0 {
+                    [0.0; 5]
+                } else {
+                    let t = total as f64;
+                    [
+                        counts[0] as f64 / t * 100.0,
+                        counts[1] as f64 / t * 100.0,
+                        counts[2] as f64 / t * 100.0,
+                        counts[3] as f64 / t * 100.0,
+                        counts[4] as f64 / t * 100.0,
+                    ]
+                }
+            })
+            .collect()
+    }
+
+    /// N content per position as percentage.
+    #[allow(dead_code)]
+    pub fn n_content_per_position(&self) -> Vec<f64> {
+        self.base_composition_pct()
+            .iter()
+            .map(|pct| pct[4])
+            .collect()
+    }
+
     /// Top N k-mers by frequency.
     pub fn top_kmers(&self, n: usize) -> Vec<(String, u64)> {
         let mut kmers: Vec<_> = self
@@ -313,7 +407,8 @@ impl SharedState {
             message,
         });
         if self.log_messages.len() > MAX_LOG_ENTRIES {
-            self.log_messages.drain(0..100);
+            // Drop oldest half to amortise repeated drains
+            self.log_messages.drain(0..MAX_LOG_ENTRIES / 2);
         }
     }
 
@@ -343,13 +438,13 @@ impl SharedState {
 
 pub fn format_number(n: u64) -> String {
     let s = n.to_string();
-    let chars: Vec<char> = s.chars().collect();
-    let len = chars.len();
-    let mut result = String::new();
-    for (i, &c) in chars.iter().enumerate() {
-        result.push(c);
-        let pos_from_end = len - i - 1;
-        if pos_from_end > 0 && pos_from_end % 3 == 0 {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut result = String::with_capacity(len + len / 3);
+    for (i, &b) in bytes.iter().enumerate() {
+        result.push(b as char);
+        let remaining = len - i - 1;
+        if remaining > 0 && remaining % 3 == 0 {
             result.push(',');
         }
     }

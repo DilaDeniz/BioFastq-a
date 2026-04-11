@@ -81,7 +81,7 @@ pub fn export_json(state: &SharedState, output_dir: &str) -> io::Result<String> 
     let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
     let report = JsonReport {
         tool: "BioFastq-A",
-        version: "2.1.0",
+        version: "2.2.0",
         generated: now,
         processing_time_seconds: state.elapsed_secs(),
         files,
@@ -159,6 +159,20 @@ h3{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;le
 .trim-box code{color:var(--accent);font-family:monospace;font-size:12px;}
 /* Footer */
 .footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;padding-top:20px;border-top:1px solid var(--border);}
+/* Module status traffic lights */
+.module-grid{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px;}
+.module-badge{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--card2);font-size:12px;}
+.module-badge .icon{font-weight:700;font-size:13px;width:16px;text-align:center;}
+.module-badge.pass .icon{color:var(--green);}
+.module-badge.warn .icon{color:var(--yellow);}
+.module-badge.fail .icon{color:var(--red);}
+.module-badge .name{color:var(--muted);}
+/* Overrepresented sequences table */
+.overrep-table{width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;margin-top:8px;}
+.overrep-table th{background:var(--card2);color:var(--muted);padding:6px 10px;text-align:left;border:1px solid var(--border);font-weight:600;}
+.overrep-table td{padding:5px 10px;border:1px solid var(--border);}
+.overrep-table tr:hover td{background:var(--card2);}
+.overrep-seq{word-break:break-all;max-width:320px;color:var(--accent);}
 "#;
 
 /// Static JavaScript for chart drawing (uses vanilla Canvas API, no deps)
@@ -393,12 +407,78 @@ function drawTile(id, data) {
   ctx.fillText('Tile ID', p.l+pw/2, H-2);
 }
 
+/* ---------- Base composition chart ---------- */
+function drawBaseComp(id, data) {
+  // data: array of [A%, C%, G%, T%, N%] per position
+  var cv=document.getElementById(id); if(!cv)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var p={l:52,r:16,t:20,b:36};
+  var pw=W-p.l-p.r, ph=H-p.t-p.b;
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
+  var colors=['#58a6ff','#3fb950','#f78166','#d29922','#8b949e']; // A,C,G,T,N
+  var labels=['A','C','G','T','N'];
+  var n=data.length, bw=pw/n;
+  // grid
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
+  for(var g=0;g<=4;g++){var y=p.t+ph*(1-g/4);ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
+  // draw lines
+  labels.forEach(function(lbl,li){
+    ctx.strokeStyle=colors[li]; ctx.lineWidth=1.5; ctx.beginPath();
+    data.forEach(function(pt,xi){
+      var x=p.l+(xi+0.5)*bw, y=p.t+ph*(1-pt[li]/100);
+      if(xi===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.stroke();
+  });
+  // axes
+  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
+  for(var g=0;g<=4;g++){ctx.fillText((g*25)+'%',2,p.t+ph*(1-g/4)+4);}
+  ctx.fillText('1',p.l,H-p.b+14);
+  ctx.fillText(n,p.l+pw-20,H-p.b+14);
+  // legend
+  var lx=p.l+4;
+  labels.forEach(function(lbl,li){
+    ctx.fillStyle=colors[li]; ctx.fillRect(lx,p.t+2,10,10);
+    ctx.fillStyle='#c9d1d9'; ctx.fillText(lbl,lx+13,p.t+11); lx+=32;
+  });
+}
+
+/* ---------- Quality distribution chart ---------- */
+function drawQualDist(id, data) {
+  // data: array of 43 counts indexed by mean Phred score
+  var cv=document.getElementById(id); if(!cv)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var p={l:52,r:16,t:20,b:36};
+  var pw=W-p.l-p.r, ph=H-p.t-p.b;
+  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
+  var max=Math.max.apply(null,data)||1;
+  var n=data.length, bw=pw/n;
+  data.forEach(function(cnt,q){
+    var pct=cnt/max;
+    var r=q<20?200:q<30?210:80, g=q<20?80:q<30?160:200, b=q<20?80:q<30?80:100;
+    ctx.fillStyle='rgba('+r+','+g+','+b+',0.85)';
+    var barH=ph*pct;
+    ctx.fillRect(p.l+q*bw, p.t+ph-barH, bw-1, barH);
+  });
+  // grid lines
+  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
+  for(var g=0;g<=4;g++){var y=p.t+ph*g/4;ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
+  // labels
+  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
+  [0,10,20,30,40].forEach(function(q){ctx.fillText('Q'+q,p.l+q*bw-8,H-p.b+14);});
+  ctx.fillText('Mean Phred per read',p.l+pw/2-60,H-2);
+}
+
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
     drawQual('qual-'+i, f.qual);
     drawLen('len-'+i, f.len);
     drawKmer('kmer-'+i, f.kmers);
+    drawBaseComp('basecomp-'+i, f.basecomp);
+    drawQualDist('qualdist-'+i, f.qualdist);
     if (f.tiles && f.tiles.length) drawTile('tile-'+i, f.tiles);
   });
 });
@@ -453,7 +533,7 @@ pub fn export_html(state: &SharedState, output_dir: &str) -> io::Result<String> 
     html.push_str("<h1>BioFastq-A Quality Analysis Report</h1>\n");
     html.push_str("<div class=\"header-meta\">\n");
     html.push_str(&format!("<span>Generated: {}</span>\n", timestamp));
-    html.push_str("<span>Tool version: 2.0.0</span>\n");
+    html.push_str("<span>Tool version: 2.2.0</span>\n");
     html.push_str(&format!(
         "<span>Files analysed: {}</span>\n",
         files.len()
@@ -474,7 +554,7 @@ pub fn export_html(state: &SharedState, output_dir: &str) -> io::Result<String> 
     html.push_str(&file_sections);
 
     // Footer
-    html.push_str("<div class=\"footer\">Generated by <strong>BioFastq-A v2.0.0</strong></div>\n");
+    html.push_str("<div class=\"footer\">Generated by <strong>BioFastq-A v2.2.0</strong></div>\n");
 
     // Embedded script
     html.push_str("<script>\n");
@@ -514,6 +594,18 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
         escape_html(&f.file_path)
     ));
     s.push_str("</div>\n<div class=\"file-body\">\n");
+
+    // Module status traffic lights (FastQC-style pass/warn/fail per module)
+    if !f.module_status.is_empty() {
+        s.push_str("<div class=\"module-grid\">\n");
+        for (name, status) in &f.module_status {
+            s.push_str(&format!(
+                "<div class=\"module-badge {}\"><span class=\"icon\">{}</span><span class=\"name\">{}</span></div>\n",
+                status.css_class(), status.icon(), escape_html(name)
+            ));
+        }
+        s.push_str("</div>\n");
+    }
 
     // Stats grid
     s.push_str("<div class=\"stats-grid\">\n");
@@ -669,7 +761,58 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
         s.push_str("</div>\n");
     }
 
-    s.push_str("</div>\n"); // charts-row
+    s.push_str("</div>\n"); // charts-row (row 3)
+
+    // Row 4: Base composition + Quality distribution
+    s.push_str("<div class=\"charts-row\">\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Per-Base Sequence Content</h3>\n");
+    s.push_str(&format!(
+        "<canvas id=\"basecomp-{}\" width=\"600\" height=\"280\"></canvas>\n",
+        idx
+    ));
+    s.push_str("<p class=\"chart-note\">Base composition (A/C/G/T/N) per read position. Uniform lines indicate balanced sequence.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Per-Read Quality Distribution</h3>\n");
+    s.push_str(&format!(
+        "<canvas id=\"qualdist-{}\" width=\"600\" height=\"280\"></canvas>\n",
+        idx
+    ));
+    s.push_str("<p class=\"chart-note\">Distribution of mean Phred quality scores across all reads. Red=poor, orange=acceptable, green=good.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("</div>\n"); // charts-row (row 4)
+
+    // Overrepresented sequences table
+    s.push_str("<div class=\"chart-box\" style=\"margin-top:16px\">\n");
+    s.push_str("<h3>Overrepresented Sequences</h3>\n");
+    if f.overrepresented_sequences.is_empty() {
+        s.push_str("<p class=\"chart-note\" style=\"padding:12px 0\">No overrepresented sequences found (&ge;0.1% of sampled reads).</p>\n");
+    } else {
+        s.push_str(&format!(
+            "<p class=\"chart-note\" style=\"margin-bottom:8px\">Sampled first 200,000 reads. Sequences present in &ge;0.1% of reads:</p>\n"
+        ));
+        s.push_str("<table class=\"overrep-table\">\n");
+        s.push_str("<thead><tr><th>#</th><th>Sequence (first 50 bp)</th><th>Count</th><th>%</th><th>Possible Source</th></tr></thead>\n");
+        s.push_str("<tbody>\n");
+        for (i, seq) in f.overrepresented_sequences.iter().enumerate() {
+            let src_cls = if seq.possible_source == "No hit" { "color:var(--muted)" } else { "color:var(--yellow)" };
+            s.push_str(&format!(
+                "<tr><td>{}</td><td class=\"overrep-seq\">{}</td><td>{}</td><td>{:.2}%</td><td style=\"{}\">{}</td></tr>\n",
+                i + 1,
+                escape_html(&seq.sequence),
+                format_number(seq.count),
+                seq.percentage,
+                src_cls,
+                escape_html(&seq.possible_source),
+            ));
+        }
+        s.push_str("</tbody></table>\n");
+    }
+    s.push_str("</div>\n");
 
     // Trim output info (only shown when trimming was active)
     if f.trim_output_path.is_some() || f.trimmed_reads > 0 {
@@ -760,12 +903,22 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         .into_iter()
         .map(|(t, q)| serde_json::json!([t, q]))
         .collect();
+    // Per-base composition: [[A%, C%, G%, T%, N%], ...]
+    let basecomp_json: Vec<serde_json::Value> = f
+        .base_composition_pct()
+        .into_iter()
+        .map(|pct| serde_json::json!(pct))
+        .collect();
+    // Quality distribution: [count_at_Q0, count_at_Q1, ..., count_at_Q42]
+    let qualdist_json: Vec<u64> = f.quality_distribution.clone();
 
     serde_json::json!({
         "qual": qual_per_pos,
         "len": len_dist,
         "kmers": kmer_json,
         "tiles": tile_json,
+        "basecomp": basecomp_json,
+        "qualdist": qualdist_json,
     })
 }
 

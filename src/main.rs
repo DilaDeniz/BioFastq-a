@@ -37,6 +37,11 @@ OPTIONS:
   --trim              Trim adapter sequences and write cleaned reads to
                       <stem>_trimmed.fastq.gz alongside the reports
   --min-length <N>    Discard trimmed reads shorter than N bp (default: 20)
+  --adapter <seq>     Additional adapter sequence to screen/trim (repeatable)
+  --quality-trim <Q>  Trim 3' bases with Phred quality below Q (default: off)
+  --in2 <file>        R2 file for paired-end mode (R1 is the positional argument)
+  --threads <N>       Number of CPU threads (default: all cores)
+  --strict            Abort on first malformed record (default: skip and warn)
   --version, -V       Print version and exit
   --help, -h          Show this help message
 
@@ -60,6 +65,11 @@ struct CliConfig {
     output_dir: String,
     trim: bool,
     min_length: u64,
+    custom_adapters: Vec<Vec<u8>>,
+    quality_trim: u8,
+    strict: bool,
+    threads: Option<usize>,
+    paired_r2: Option<String>,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -80,6 +90,11 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut output_dir = ".".to_string();
     let mut trim = false;
     let mut min_length: u64 = 20;
+    let mut custom_adapters: Vec<Vec<u8>> = Vec::new();
+    let mut quality_trim: u8 = 0;
+    let mut strict = false;
+    let mut threads: Option<usize> = None;
+    let mut paired_r2: Option<String> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -102,6 +117,43 @@ fn parse_args() -> Result<CliConfig, String> {
                     .parse()
                     .map_err(|_| format!("--min-length must be an integer, got '{}'", args[i]))?;
             }
+            "--adapter" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--adapter requires a sequence value".into());
+                }
+                custom_adapters.push(args[i].to_uppercase().into_bytes());
+            }
+            "--quality-trim" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--quality-trim requires a Phred value".into());
+                }
+                quality_trim = args[i]
+                    .parse()
+                    .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
+            }
+            "--strict" => strict = true,
+            "--in2" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--in2 requires a file path".into());
+                }
+                paired_r2 = Some(args[i].clone());
+            }
+            "--threads" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--threads requires a value".into());
+                }
+                let n: usize = args[i]
+                    .parse()
+                    .map_err(|_| format!("--threads must be a positive integer, got '{}'", args[i]))?;
+                if n == 0 {
+                    return Err("--threads must be at least 1".into());
+                }
+                threads = Some(n);
+            }
             arg if arg.starts_with("--") => {
                 return Err(format!("Unknown option: {}  (use --help for usage)", arg));
             }
@@ -120,7 +172,61 @@ fn parse_args() -> Result<CliConfig, String> {
         output_dir,
         trim,
         min_length,
+        custom_adapters,
+        quality_trim,
+        strict,
+        threads,
+        paired_r2,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Output helpers
+// ---------------------------------------------------------------------------
+
+fn print_file_summary(f: &types::FileStats) {
+    let (n50, n90) = f.compute_n50_n90();
+    let fname = std::path::Path::new(&f.file_path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(&f.file_path);
+
+    println!(
+        "  File:            {}\n  \
+         Reads:           {}\n  \
+         Total bases:     {}\n  \
+         Avg length:      {:.1} bp\n  \
+         Min / Max:       {} / {} bp\n  \
+         N50 / N90:       {} / {} bp\n  \
+         GC content:      {:.2}%\n  \
+         Avg quality:     Q{:.1}\n  \
+         Q20 bases:       {:.1}%\n  \
+         Q30 bases:       {:.1}%\n  \
+         Adapter cont:    {:.2}%\n  \
+         Dup rate (est):  {:.1}%",
+        fname,
+        format_number(f.read_count),
+        types::format_bases(f.total_bases),
+        f.avg_length(),
+        f.effective_min_length(), f.max_length,
+        n50, n90,
+        f.gc_content(),
+        f.avg_quality(),
+        f.q20_pct(),
+        f.q30_pct(),
+        f.adapter_pct(),
+        f.dup_rate_pct,
+    );
+    if f.trimmed_reads > 0 {
+        println!("  Trimmed reads:   {} ({:.1}%)", format_number(f.trimmed_reads), f.trimmed_pct());
+        if let Some(ref tp) = f.trim_output_path {
+            println!("  Trim output:     {}", tp);
+        }
+    }
+    if !f.per_tile_quality.is_empty() {
+        println!("  Illumina tiles:  {}", f.per_tile_quality.len());
+    }
+    println!();
 }
 
 // ---------------------------------------------------------------------------
@@ -135,6 +241,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Configure rayon thread pool
+    if let Some(n) = cfg.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .unwrap_or_else(|e| eprintln!("Warning: could not set thread count: {}", e));
+    }
 
     // Validate input files
     for path in &cfg.input_files {
@@ -160,10 +274,20 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Validate --in2 is only used with a single R1 input
+    if cfg.paired_r2.is_some() && cfg.input_files.len() != 1 {
+        eprintln!("Error: --in2 requires exactly one R1 input file.");
+        std::process::exit(1);
+    }
+
     let process_config = ProcessConfig {
         trim_output: cfg.trim,
         min_length: cfg.min_length,
         output_dir: cfg.output_dir.clone(),
+        custom_adapters: cfg.custom_adapters.clone(),
+        quality_trim_threshold: cfg.quality_trim,
+        strict: cfg.strict,
+        paired_end_r2: cfg.paired_r2.clone(),
     };
 
     let n_files = cfg.input_files.len();
@@ -227,47 +351,9 @@ fn main() {
     match &snap.status {
         ProcessingStatus::Completed => {
             println!("\nAnalysis complete!\n");
-
             for f in snap.all_files() {
-                let (n50, n90) = f.compute_n50_n90();
-                let fname = std::path::Path::new(&f.file_path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&f.file_path);
-
-                println!("  File:            {}", fname);
-                println!("  Reads:           {}", format_number(f.read_count));
-                println!("  Total bases:     {}", types::format_bases(f.total_bases));
-                println!("  Avg length:      {:.1} bp", f.avg_length());
-                println!(
-                    "  Min / Max:       {} / {} bp",
-                    f.effective_min_length(),
-                    f.max_length
-                );
-                println!("  N50:             {} bp", n50);
-                println!("  N90:             {} bp", n90);
-                println!("  GC content:      {:.2}%", f.gc_content());
-                println!("  Avg quality:     Q{:.1}", f.avg_quality());
-                println!("  Q20 reads:       {:.1}%", f.q20_pct());
-                println!("  Q30 reads:       {:.1}%", f.q30_pct());
-                println!("  Adapter cont:    {:.2}%", f.adapter_pct());
-                println!("  Dup rate (est):  {:.1}%", f.dup_rate_pct);
-                if f.trimmed_reads > 0 {
-                    println!(
-                        "  Trimmed reads:   {} ({:.1}%)",
-                        format_number(f.trimmed_reads),
-                        f.trimmed_pct()
-                    );
-                    if let Some(ref tp) = f.trim_output_path {
-                        println!("  Trim output:     {}", tp);
-                    }
-                }
-                if !f.per_tile_quality.is_empty() {
-                    println!("  Illumina tiles:  {}", f.per_tile_quality.len());
-                }
-                println!();
+                print_file_summary(f);
             }
-
             match report::export_html(&snap, &cfg.output_dir) {
                 Ok(path) => println!("HTML report:  {}", path),
                 Err(e) => eprintln!("Warning: HTML report failed: {}", e),
@@ -276,15 +362,13 @@ fn main() {
                 Ok(path) => println!("JSON report:  {}", path),
                 Err(e) => eprintln!("Warning: JSON report failed: {}", e),
             }
-
             let elapsed = snap.elapsed_secs();
             let total_reads: u64 = snap.all_files().iter().map(|f| f.read_count).sum();
             let total_bytes: u64 = snap.all_files().iter().map(|f| f.file_size).sum();
-            let reads_per_sec = if elapsed > 0.0 { total_reads as f64 / elapsed } else { 0.0 };
-            let mb_per_sec = if elapsed > 0.0 { total_bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
-
-            println!("Processing time:  {:.1}s", elapsed);
-            println!("Throughput:       {:.0} reads/s  |  {:.0} MB/s", reads_per_sec, mb_per_sec);
+            let rps = if elapsed > 0.0 { total_reads as f64 / elapsed } else { 0.0 };
+            let mbs = if elapsed > 0.0 { total_bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
+            println!("\nProcessing time:  {:.1}s", elapsed);
+            println!("Throughput:       {:.0} reads/s  |  {:.0} MB/s", rps, mbs);
         }
         ProcessingStatus::Error(e) => {
             eprintln!("\nAnalysis failed: {}", e);

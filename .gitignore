@@ -1,4 +1,24 @@
 /target
+
+# Reports
 *_report.json
 *_report.html
+sample_report.*
+test_sample_report.*
+
+# Test & benchmark data (large files — download separately)
+*.fastq
+*.fasta
+*.fastq.gz
+*.fasta.gz
 test_100k.fastq
+
+# FastQC / fastp temp files
+FastQC/
+fastqc_*.zip
+fastp.html
+fastp.json
+fasterq.tmp.*
+
+# Misc
+*.bak
