@@ -8,9 +8,7 @@ export CARGO_PROFILE_RELEASE_STRIP=false
 # issues in some conda-build environments.
 export CARGO_HOME="${SRC_DIR}/.cargo-home"
 
-# --locked ensures we use the exact dependency versions from Cargo.lock,
-# making the build reproducible and avoiding network resolution failures.
-cargo build --release --locked
+cargo build --release
 
 # install -D creates $PREFIX/bin if it doesn't already exist.
 install -Dm755 "target/release/biofastq-a" "${PREFIX}/bin/biofastq-a"
