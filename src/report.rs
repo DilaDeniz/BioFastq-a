@@ -3,7 +3,6 @@ use std::io;
 use std::path::Path;
 
 use serde::Serialize;
-use serde_json;
 
 use crate::types::{format_bases, format_number, FileStats, SharedState, ADAPTERS};
 
@@ -792,9 +791,7 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
     if f.overrepresented_sequences.is_empty() {
         s.push_str("<p class=\"chart-note\" style=\"padding:12px 0\">No overrepresented sequences found (&ge;0.1% of sampled reads).</p>\n");
     } else {
-        s.push_str(&format!(
-            "<p class=\"chart-note\" style=\"margin-bottom:8px\">Sampled first 200,000 reads. Sequences present in &ge;0.1% of reads:</p>\n"
-        ));
+        s.push_str("<p class=\"chart-note\" style=\"margin-bottom:8px\">Sampled first 200,000 reads. Sequences present in &ge;0.1% of reads:</p>\n");
         s.push_str("<table class=\"overrep-table\">\n");
         s.push_str("<thead><tr><th>#</th><th>Sequence (first 50 bp)</th><th>Count</th><th>%</th><th>Possible Source</th></tr></thead>\n");
         s.push_str("<tbody>\n");
@@ -954,9 +951,9 @@ fn quality_class(q: f64) -> &'static str {
 }
 
 fn gc_class(gc: f64) -> &'static str {
-    if gc >= 35.0 && gc <= 65.0 {
+    if (35.0..=65.0).contains(&gc) {
         "pass"
-    } else if gc >= 25.0 && gc <= 75.0 {
+    } else if (25.0..=75.0).contains(&gc) {
         "warn"
     } else {
         "fail"
