@@ -56,6 +56,8 @@ QC MODULE TOGGLES:
 OUTPUT OPTIONS:
   --no-html           Skip HTML report generation
   --no-json           Skip JSON report generation
+  --multiqc           Write a MultiQC-compatible <stem>_mqc.json file
+                      (drop it next to multiqc_data/ and run multiqc .)
 
 OUTPUT FILES:
   <stem>_report.html      Self-contained HTML report with interactive charts
@@ -93,6 +95,7 @@ struct CliConfig {
     no_html: bool,
     no_json: bool,
     fast: bool,
+    multiqc: bool,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -126,6 +129,7 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut no_html = false;
     let mut no_json = false;
     let mut fast = false;
+    let mut multiqc = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -173,6 +177,7 @@ fn parse_args() -> Result<CliConfig, String> {
             "--no-html" => no_html = true,
             "--no-json" => no_json = true,
             "--fast" => fast = true,
+            "--multiqc" => multiqc = true,
             "--in2" => {
                 i += 1;
                 if i >= args.len() {
@@ -224,6 +229,7 @@ fn parse_args() -> Result<CliConfig, String> {
         no_html,
         no_json,
         fast,
+        multiqc,
     })
 }
 
@@ -425,6 +431,12 @@ fn main() {
                 match report::export_json(&snap, &cfg.output_dir) {
                     Ok(path) => println!("JSON report:  {}", path),
                     Err(e) => eprintln!("Warning: JSON report failed: {}", e),
+                }
+            }
+            if cfg.multiqc {
+                match report::export_multiqc(&snap, &cfg.output_dir) {
+                    Ok(path) => println!("MultiQC data: {}", path),
+                    Err(e) => eprintln!("Warning: MultiQC export failed: {}", e),
                 }
             }
             let elapsed = snap.elapsed_secs();

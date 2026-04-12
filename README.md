@@ -122,9 +122,22 @@ OPTIONS:
   --quality-trim <Q>     Trim 3' bases with Phred quality below Q (default: off)
   --threads <N>          Number of CPU threads (default: all cores)
   --strict               Abort on first malformed record (default: skip & warn)
-  --paired-end <R2>      Paired-end mode: provide R2 file path
+  --in2 <R2>             Paired-end mode: provide R2 file path
   --version, -V          Print version
   --help, -h             Show help
+
+QC MODULE TOGGLES (all on by default):
+  --no-kmer              Skip k-mer frequency analysis
+  --no-duplication       Skip duplicate read estimation
+  --no-per-tile          Skip per-tile Illumina quality
+  --no-overrep           Skip overrepresented sequence detection
+  --no-adapter           Skip adapter content analysis
+  --fast                 Quick mode: disables kmer, dup, per-tile, overrep
+
+OUTPUT OPTIONS:
+  --no-html              Skip HTML report
+  --no-json              Skip JSON report
+  --multiqc              Write <stem>_mqc.json (MultiQC general stats table)
 ```
 
 ---
@@ -158,6 +171,7 @@ Each module shows a **FastQC-style traffic light** (Pass / Warn / Fail).
 ```
 <stem>_report.html      — self-contained HTML report (offline, no CDN)
 <stem>_report.json      — machine-readable JSON for pipelines
+<stem>_mqc.json         — MultiQC general stats table (with --multiqc)
 <stem>_trimmed.fastq.gz — trimmed reads (only with --trim)
 ```
 
@@ -248,6 +262,20 @@ rule fastq_qc:
         json = "qc/{sample}_report.json"
     shell:
         "biofastq-a {input} --headless --output-dir qc/"
+
+# With MultiQC aggregation across all samples:
+rule multiqc:
+    input:  expand("qc/{sample}_mqc.json", sample=SAMPLES)
+    output: "qc/multiqc_report.html"
+    shell:  "multiqc qc/ -o qc/"
+
+rule fastq_qc_multiqc:
+    input:  "data/{sample}.fastq.gz"
+    output:
+        html = "qc/{sample}_report.html",
+        mqc  = "qc/{sample}_mqc.json"
+    shell:
+        "biofastq-a {input} --headless --multiqc --output-dir qc/"
 ```
 
 </details>
@@ -258,13 +286,35 @@ rule fastq_qc:
 ```groovy
 process BIOFASTQA {
     input:  path fastq
-    output: path "*_report.{html,json}"
+    output: path "*_report.{html,json}", path "*_mqc.json" optional true
     script:
     """
-    biofastq-a ${fastq} --headless --output-dir .
+    biofastq-a ${fastq} --headless --multiqc --output-dir .
     """
 }
 ```
+
+</details>
+
+<details>
+<summary><b>MultiQC integration</b></summary>
+
+`--multiqc` writes `<stem>_mqc.json` — a file MultiQC picks up automatically when you run `multiqc .` in the same directory.
+
+The file feeds the **General Statistics** table with:
+Total Reads · % GC · Avg Length · Avg Quality · % Q30 · % Adapter · % Dups · N50
+
+```bash
+# Run BioFastq-A with MultiQC output on all samples
+for f in data/*.fastq.gz; do
+    biofastq-a "$f" --headless --multiqc --output-dir qc/
+done
+
+# Aggregate everything into one MultiQC report
+multiqc qc/ -o qc/
+```
+
+The `_mqc.json` format follows the [MultiQC custom content spec](https://multiqc.info/docs/custom_content/) and is compatible with MultiQC ≥ 1.9.
 
 </details>
 
