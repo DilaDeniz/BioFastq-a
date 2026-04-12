@@ -96,6 +96,85 @@ pub fn export_json(state: &SharedState, output_dir: &str) -> io::Result<String> 
 }
 
 // ---------------------------------------------------------------------------
+// MultiQC custom-content export  (*_mqc.json)
+//
+// MultiQC picks up any file named `*_mqc.json` in the run directory and
+// merges it into the MultiQC report as a General Statistics table section.
+// Format spec: https://multiqc.info/docs/custom_content/
+// ---------------------------------------------------------------------------
+
+/// Derive a clean sample name from a file path: strip directory, then
+/// strip .gz, then strip .fastq / .fasta / .fq / .fa extensions.
+fn sample_name_from_path(file_path: &str) -> String {
+    let p = std::path::Path::new(file_path);
+    // strip .gz
+    let s1 = if p.extension().map(|e| e == "gz").unwrap_or(false) {
+        p.file_stem().unwrap_or(p.as_os_str())
+    } else {
+        p.file_name().unwrap_or(p.as_os_str())
+    };
+    // strip .fastq / .fasta / .fq / .fa
+    let p2 = std::path::Path::new(s1);
+    p2.file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file_path)
+        .to_string()
+}
+
+pub fn export_multiqc(state: &SharedState, output_dir: &str) -> io::Result<String> {
+    let files = state.all_files();
+    if files.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "No file data"));
+    }
+
+    // Build per-sample data map
+    let mut data = serde_json::Map::new();
+    for f in &files {
+        let sample = sample_name_from_path(&f.file_path);
+        let (n50, _) = f.compute_n50_n90();
+        let mut m = serde_json::Map::new();
+        m.insert("total_sequences".into(),   f.read_count.into());
+        m.insert("total_bases".into(),       f.total_bases.into());
+        m.insert("avg_sequence_length".into(), f.avg_length().into());
+        m.insert("percent_gc".into(),        f.gc_content().into());
+        m.insert("mean_quality".into(),      f.avg_quality().into());
+        m.insert("percent_q30".into(),       f.q30_pct().into());
+        m.insert("percent_adapter".into(),   f.adapter_pct().into());
+        m.insert("percent_duplicates".into(),f.dup_rate_pct.into());
+        m.insert("n50".into(),               n50.into());
+        data.insert(sample, serde_json::Value::Object(m));
+    }
+
+    // Column configuration for the General Statistics table
+    let pconfig = serde_json::json!([
+        {"total_sequences":   {"title": "Total Reads",   "description": "Total number of reads",             "format": "{:,.0f}", "scale": "Blues", "shared_key": "read_count"}},
+        {"percent_gc":        {"title": "% GC",          "description": "GC content (%)",                    "min": 0, "max": 100, "suffix": "%", "format": "{:.1f}", "scale": "RdYlGn"}},
+        {"avg_sequence_length":{"title": "Avg Length",   "description": "Average read length (bp)",          "suffix": " bp", "format": "{:.0f}"}},
+        {"mean_quality":      {"title": "Avg Quality",   "description": "Mean Phred quality score",          "min": 0, "max": 42, "format": "{:.1f}", "scale": "RdYlGn"}},
+        {"percent_q30":       {"title": "% Q30",         "description": "Bases with Phred ≥ Q30 (%)",        "min": 0, "max": 100, "suffix": "%", "format": "{:.1f}", "scale": "RdYlGn"}},
+        {"percent_adapter":   {"title": "% Adapter",     "description": "Reads with adapter contamination",  "min": 0, "max": 100, "suffix": "%", "format": "{:.2f}", "scale": "Oranges"}},
+        {"percent_duplicates":{"title": "% Dups",        "description": "Estimated duplication rate (%)",    "min": 0, "max": 100, "suffix": "%", "format": "{:.1f}", "scale": "Reds"}},
+        {"total_bases":       {"title": "Total Bases",   "description": "Total sequenced bases",             "format": "{:,.0f}", "shared_key": "base_count"}},
+        {"n50":               {"title": "N50",           "description": "N50 read length (bp)",              "suffix": " bp", "format": "{:,.0f}"}}
+    ]);
+
+    let report = serde_json::json!({
+        "id": "biofastq_a",
+        "section_name": "BioFastq-A",
+        "description": "High-performance FASTQ/FASTA quality analysis",
+        "plot_type": "generalstats",
+        "pconfig": pconfig,
+        "data": serde_json::Value::Object(data)
+    });
+
+    let json = serde_json::to_string_pretty(&report).map_err(io::Error::other)?;
+    let stem = report_stem(&files);
+    let path = format!("{}/{}_mqc.json", output_dir, stem);
+    fs::write(&path, &json)?;
+    Ok(path)
+}
+
+// ---------------------------------------------------------------------------
 // HTML report
 // ---------------------------------------------------------------------------
 
