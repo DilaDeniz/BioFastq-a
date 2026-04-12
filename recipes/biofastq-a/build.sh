@@ -1,4 +1,6 @@
 #!/bin/bash
 set -euxo pipefail
 
-cargo install --no-track --root "$PREFIX" --path .
+export CARGO_PROFILE_RELEASE_STRIP=false
+cargo build --release
+install -m755 target/release/biofastq-a "$PREFIX/bin/biofastq-a"
