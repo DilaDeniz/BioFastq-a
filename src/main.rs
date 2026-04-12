@@ -359,9 +359,8 @@ fn main() {
         default_hook(info);
     }));
 
-    // Stash report flags before process_config is moved into the thread
-    let report_html = process_config.flags.html_report;
-    let report_json = process_config.flags.json_report;
+    // Stash flags before process_config is moved into the thread
+    let report_flags = process_config.flags.clone();
 
     // Spawn processing thread
     let state_worker = Arc::clone(&state);
@@ -416,13 +415,13 @@ fn main() {
             for f in snap.all_files() {
                 print_file_summary(f);
             }
-            if report_html {
-                match report::export_html(&snap, &cfg.output_dir) {
+            if report_flags.html_report {
+                match report::export_html(&snap, &cfg.output_dir, &report_flags) {
                     Ok(path) => println!("HTML report:  {}", path),
                     Err(e) => eprintln!("Warning: HTML report failed: {}", e),
                 }
             }
-            if report_json {
+            if report_flags.json_report {
                 match report::export_json(&snap, &cfg.output_dir) {
                     Ok(path) => println!("JSON report:  {}", path),
                     Err(e) => eprintln!("Warning: JSON report failed: {}", e),

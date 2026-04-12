@@ -4,7 +4,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::types::{format_bases, format_number, FileStats, SharedState, ADAPTERS};
+use crate::types::{format_bases, format_number, FileStats, FeatureFlags, SharedState, ADAPTERS};
 
 // ---------------------------------------------------------------------------
 // JSON export structures
@@ -487,7 +487,7 @@ window.addEventListener('load', function(){
 // HTML generation
 // ---------------------------------------------------------------------------
 
-pub fn export_html(state: &SharedState, output_dir: &str) -> io::Result<String> {
+pub fn export_html(state: &SharedState, output_dir: &str, flags: &FeatureFlags) -> io::Result<String> {
     let files = state.all_files();
     if files.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "No file data"));
@@ -503,7 +503,7 @@ pub fn export_html(state: &SharedState, output_dir: &str) -> io::Result<String> 
     let mut json_files: Vec<serde_json::Value> = Vec::new();
 
     for (i, f) in files.iter().enumerate() {
-        file_sections.push_str(&build_file_section(f, i));
+        file_sections.push_str(&build_file_section(f, i, flags));
         json_files.push(build_file_json(f));
     }
 
@@ -566,7 +566,14 @@ pub fn export_html(state: &SharedState, output_dir: &str) -> io::Result<String> 
     Ok(path)
 }
 
-fn build_file_section(f: &FileStats, idx: usize) -> String {
+fn skipped_notice(flag: &str) -> String {
+    format!(
+        "<p class=\"chart-note\" style=\"padding:20px 0;font-style:italic\">Module skipped &mdash; <code>{}</code> was active.</p>\n",
+        flag
+    )
+}
+
+fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String {
     let (n50, n90) = f.compute_n50_n90();
     let fname = Path::new(&f.file_path)
         .file_name()
@@ -688,25 +695,33 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
 
     s.push_str("<div class=\"chart-box\">\n");
     s.push_str("<h3>Top K-mer Frequencies (4-mer)</h3>\n");
-    s.push_str(&format!(
-        "<canvas id=\"kmer-{}\" width=\"600\" height=\"300\"></canvas>\n",
-        idx
-    ));
+    if flags.kmer_analysis {
+        s.push_str(&format!(
+            "<canvas id=\"kmer-{}\" width=\"600\" height=\"300\"></canvas>\n",
+            idx
+        ));
+    } else {
+        s.push_str(&skipped_notice("--no-kmer / --fast"));
+    }
     s.push_str("</div>\n");
 
     // Adapter info card
     s.push_str("<div class=\"chart-box\">\n");
     s.push_str("<h3>Adapter Contamination</h3>\n");
-    s.push_str("<div class=\"adapter-grid\">\n");
-    s.push_str(&format!(
-        "<div><div class=\"big-pct {}\">{:.1}%</div><div style=\"color:var(--muted);font-size:12px;margin-top:4px\">reads with adapter</div></div>\n",
-        adapter_class, f.adapter_pct()
-    ));
-    s.push_str("<div>\n");
-    s.push_str("<p style=\"font-size:12px;color:var(--muted);margin-bottom:6px\">Screened sequences:</p>\n");
-    s.push_str("<ul class=\"adapter-list\">\n");
-    s.push_str(&adapter_list);
-    s.push_str("</ul>\n</div>\n</div>\n");
+    if flags.adapter_detection {
+        s.push_str("<div class=\"adapter-grid\">\n");
+        s.push_str(&format!(
+            "<div><div class=\"big-pct {}\">{:.1}%</div><div style=\"color:var(--muted);font-size:12px;margin-top:4px\">reads with adapter</div></div>\n",
+            adapter_class, f.adapter_pct()
+        ));
+        s.push_str("<div>\n");
+        s.push_str("<p style=\"font-size:12px;color:var(--muted);margin-bottom:6px\">Screened sequences:</p>\n");
+        s.push_str("<ul class=\"adapter-list\">\n");
+        s.push_str(&adapter_list);
+        s.push_str("</ul>\n</div>\n</div>\n");
+    } else {
+        s.push_str(&skipped_notice("--no-adapter"));
+    }
     s.push_str("</div>\n");
 
     s.push_str("</div>\n"); // charts-row
@@ -715,50 +730,54 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
     s.push_str("<div class=\"charts-row\">\n");
 
     // Duplication card
-    let dup_class = dup_status_class(f.dup_rate_pct);
-    let dup_bar_color = match dup_class {
-        "pass" => "var(--green)",
-        "warn" => "var(--yellow)",
-        _ => "var(--red)",
-    };
     s.push_str("<div class=\"chart-box\">\n");
     s.push_str("<h3>Duplication Rate (estimate)</h3>\n");
-    s.push_str("<div class=\"dup-gauge-wrap\" style=\"margin-bottom:12px\">\n");
-    s.push_str(&format!(
-        "<span class=\"stat-value {}\" style=\"font-size:32px;min-width:80px\">{:.1}%</span>\n",
-        dup_class, f.dup_rate_pct
-    ));
-    s.push_str("<div class=\"dup-gauge-track\">\n");
-    s.push_str(&format!(
-        "<div class=\"dup-gauge-fill\" style=\"width:{:.1}%;background:{}\"></div>\n",
-        f.dup_rate_pct.min(100.0),
-        dup_bar_color
-    ));
-    s.push_str("</div>\n</div>\n");
-    s.push_str("<p class=\"chart-note\">Estimated from fingerprint hashing of first 200,000 reads. &lt;5% = pass &nbsp;|&nbsp; 5–20% = warn &nbsp;|&nbsp; &gt;20% = high</p>\n");
+    if flags.duplication_check {
+        let dup_class = dup_status_class(f.dup_rate_pct);
+        let dup_bar_color = match dup_class {
+            "pass" => "var(--green)",
+            "warn" => "var(--yellow)",
+            _ => "var(--red)",
+        };
+        s.push_str("<div class=\"dup-gauge-wrap\" style=\"margin-bottom:12px\">\n");
+        s.push_str(&format!(
+            "<span class=\"stat-value {}\" style=\"font-size:32px;min-width:80px\">{:.1}%</span>\n",
+            dup_class, f.dup_rate_pct
+        ));
+        s.push_str("<div class=\"dup-gauge-track\">\n");
+        s.push_str(&format!(
+            "<div class=\"dup-gauge-fill\" style=\"width:{:.1}%;background:{}\"></div>\n",
+            f.dup_rate_pct.min(100.0),
+            dup_bar_color
+        ));
+        s.push_str("</div>\n</div>\n");
+        s.push_str("<p class=\"chart-note\">Estimated from fingerprint hashing of first 200,000 reads. &lt;5% = pass &nbsp;|&nbsp; 5–20% = warn &nbsp;|&nbsp; &gt;20% = high</p>\n");
+    } else {
+        s.push_str(&skipped_notice("--no-duplication / --fast"));
+    }
     s.push_str("</div>\n");
 
-    // Per-tile quality card (only if Illumina data was detected)
-    let tile_data = f.sorted_tile_quality();
-    if !tile_data.is_empty() {
-        s.push_str("<div class=\"chart-box\">\n");
-        s.push_str("<h3>Per-Tile Quality Score</h3>\n");
-        s.push_str(&format!(
-            "<canvas id=\"tile-{}\" width=\"600\" height=\"200\"></canvas>\n",
-            idx
-        ));
-        s.push_str(&format!(
-            "<p class=\"chart-note\">{} Illumina tiles detected. Bars coloured red→green by quality.</p>\n",
-            tile_data.len()
-        ));
-        s.push_str("</div>\n");
+    // Per-tile quality card
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<h3>Per-Tile Quality Score</h3>\n");
+    if !flags.per_tile_quality {
+        s.push_str(&skipped_notice("--no-per-tile / --fast"));
     } else {
-        // No Illumina tiles — show note
-        s.push_str("<div class=\"chart-box\">\n");
-        s.push_str("<h3>Per-Tile Quality Score</h3>\n");
-        s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No Illumina tile information found in read headers.<br>Per-tile QC requires standard Illumina CASAVA 1.8+ headers.</p>\n");
-        s.push_str("</div>\n");
+        let tile_data = f.sorted_tile_quality();
+        if !tile_data.is_empty() {
+            s.push_str(&format!(
+                "<canvas id=\"tile-{}\" width=\"600\" height=\"200\"></canvas>\n",
+                idx
+            ));
+            s.push_str(&format!(
+                "<p class=\"chart-note\">{} Illumina tiles detected. Bars coloured red→green by quality.</p>\n",
+                tile_data.len()
+            ));
+        } else {
+            s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No Illumina tile information found in read headers.<br>Per-tile QC requires standard Illumina CASAVA 1.8+ headers.</p>\n");
+        }
     }
+    s.push_str("</div>\n");
 
     s.push_str("</div>\n"); // charts-row (row 3)
 
@@ -788,7 +807,9 @@ fn build_file_section(f: &FileStats, idx: usize) -> String {
     // Overrepresented sequences table
     s.push_str("<div class=\"chart-box\" style=\"margin-top:16px\">\n");
     s.push_str("<h3>Overrepresented Sequences</h3>\n");
-    if f.overrepresented_sequences.is_empty() {
+    if !flags.overrep_sequences {
+        s.push_str(&skipped_notice("--no-overrep / --fast"));
+    } else if f.overrepresented_sequences.is_empty() {
         s.push_str("<p class=\"chart-note\" style=\"padding:12px 0\">No overrepresented sequences found (&ge;0.1% of sampled reads).</p>\n");
     } else {
         s.push_str("<p class=\"chart-note\" style=\"margin-bottom:8px\">Sampled first 200,000 reads. Sequences present in &ge;0.1% of reads:</p>\n");
