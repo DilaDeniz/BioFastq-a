@@ -11,4 +11,4 @@ export CARGO_HOME="${SRC_DIR}/.cargo-home"
 cargo build --release
 
 # install -D creates $PREFIX/bin if it doesn't already exist.
-install -Dm755 "target/release/biofastq-a" "${PREFIX}/bin/biofastq-a"
+install -Dm755 "${SRC_DIR}/target/release/biofastq-a" "${PREFIX}/bin/biofastq-a"
