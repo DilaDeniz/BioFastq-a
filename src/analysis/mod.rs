@@ -10,7 +10,6 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crossbeam_channel;
 use needletail::parse_fastx_file;
 use needletail::Sequence;
 use rayon::prelude::*;
@@ -49,7 +48,10 @@ fn trim_record<'a>(
         (seq, qual)
     };
 
-    // Adapter detection
+    // Adapter detection (skip when --no-adapter is set)
+    if !config.flags.adapter_detection {
+        return (seq, qual, false);
+    }
     match adapters::find_adapter_pos_with_custom(seq, &config.custom_adapters) {
         Some(pos) => (&seq[..pos], qual.map(|q| &q[..pos.min(q.len())]), true),
         None => (seq, qual, false),
@@ -365,19 +367,24 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
         // --- Parallel stats computation ---
         let cfg = config;
+        let per_tile_enabled = cfg.flags.per_tile_quality;
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, |mut acc, rec| {
+            .fold(BatchAccum::default, move |mut acc, rec| {
                 let (effective_seq, effective_qual, adapter_hit) =
                     trim_record(&rec.seq, rec.qual.as_deref(), cfg);
 
-                // Per-tile
-                let tile_info = parse_illumina_tile(&rec.id).and_then(|tile_id| {
-                    effective_qual.map(|q| {
-                        let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
-                        (tile_id, phred_sum, q.len() as u64)
+                // Per-tile (skip when --no-per-tile or --fast)
+                let tile_info = if per_tile_enabled {
+                    parse_illumina_tile(&rec.id).and_then(|tile_id| {
+                        effective_qual.map(|q| {
+                            let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                            (tile_id, phred_sum, q.len() as u64)
+                        })
                     })
-                });
+                } else {
+                    None
+                };
 
                 let fp = fingerprint(effective_seq);
                 acc.process(effective_seq, effective_qual, tile_info, fp, adapter_hit);
@@ -385,28 +392,34 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // --- Deterministic dedup: exact count on first OVERREP_SAMPLE reads ---
-        for &fp in &acc.fingerprints {
-            if dup_sampled < OVERREP_SAMPLE {
-                *dup_map.entry(fp).or_insert(0) += 1;
-                dup_sampled += 1;
+        // --- Deterministic dedup (skip when --no-duplication or --fast) ---
+        if config.flags.duplication_check {
+            for &fp in &acc.fingerprints {
+                if dup_sampled < OVERREP_SAMPLE {
+                    *dup_map.entry(fp).or_insert(0) += 1;
+                    dup_sampled += 1;
+                }
             }
         }
 
         // --- Overrepresented sequences + K-mer counting ---
         if !acc.kmer_seqs.is_empty() {
-            for seq in &acc.kmer_seqs {
-                if overrep_sampled < OVERREP_SAMPLE {
-                    let mut key = [0u8; 50];
-                    let n = seq.len().min(50);
-                    key[..n].copy_from_slice(&seq[..n]);
-                    *overrep_map.entry(key).or_insert(0) += 1;
-                    overrep_sampled += 1;
+            if config.flags.overrep_sequences {
+                for seq in &acc.kmer_seqs {
+                    if overrep_sampled < OVERREP_SAMPLE {
+                        let mut key = [0u8; 50];
+                        let n = seq.len().min(50);
+                        key[..n].copy_from_slice(&seq[..n]);
+                        *overrep_map.entry(key).or_insert(0) += 1;
+                        overrep_sampled += 1;
+                    }
                 }
             }
-            let kmers = count_kmers_parallel(&acc.kmer_seqs);
-            for (k, v) in kmers {
-                *kmer_total.entry(k).or_insert(0) += v;
+            if config.flags.kmer_analysis {
+                let kmers = count_kmers_parallel(&acc.kmer_seqs);
+                for (k, v) in kmers {
+                    *kmer_total.entry(k).or_insert(0) += v;
+                }
             }
         }
 
@@ -447,12 +460,12 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         for i in 0..crate::types::MAX_QUAL_POSITION {
             quality_by_pos[i].0    += acc.quality_by_pos[i].0;
             quality_by_pos[i].1    += acc.quality_by_pos[i].1;
-            for j in 0..5 {
-                base_composition[i][j] += acc.base_composition[i][j];
+            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) {
+                *lhs += rhs;
             }
         }
-        for i in 0..PHRED_BUCKETS {
-            quality_distribution[i] += acc.quality_distribution[i];
+        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) {
+            *lhs += rhs;
         }
         for (k, v) in acc.per_tile {
             let e = per_tile.entry(k).or_insert((0, 0));
@@ -483,7 +496,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
                 cur.bytes_processed = bytes.min(file_size);
             }
 
-            if total_flushed % 500_000 == 0 {
+            if total_flushed.is_multiple_of(500_000) {
                 let elapsed = s.elapsed_secs();
                 let rps  = if elapsed > 0.0 { read_count as f64 / elapsed } else { 0.0 };
                 let mbps = if elapsed > 0.0 { bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
@@ -648,49 +661,60 @@ fn process_single_file_mmap(
     // --- Consumer: receive batches, process with rayon while producer reads ahead ---
     // Deref Arc<Mmap> → &[u8] once; safe to share across all rayon workers
     // because Mmap is Sync and outlives all rayon fold calls below.
-    let mmap_bytes: &[u8] = &**mmap_arc;
+    let mmap_bytes: &[u8] = &mmap_arc;
 
     while let Ok((batch, batch_bytes)) = rx.recv() {
         bytes += batch_bytes;
 
+        let per_tile_enabled = config.flags.per_tile_quality;
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, |mut acc, range| {
+            .fold(BatchAccum::default, move |mut acc, range| {
                 let id   = range.id(mmap_bytes);
                 let seq  = range.seq(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
                 let (eff_seq, eff_qual, adapter_hit) =
                     trim_record(seq, Some(qual), config);
-                let tile_info = parse_illumina_tile(id).and_then(|tile_id| {
-                    eff_qual.map(|q| {
-                        let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
-                        (tile_id, phred_sum, q.len() as u64)
+                let tile_info = if per_tile_enabled {
+                    parse_illumina_tile(id).and_then(|tile_id| {
+                        eff_qual.map(|q| {
+                            let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                            (tile_id, phred_sum, q.len() as u64)
+                        })
                     })
-                });
+                } else {
+                    None
+                };
                 let fp = fingerprint(eff_seq);
                 acc.process(eff_seq, eff_qual, tile_info, fp, adapter_hit);
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        for &fp in &acc.fingerprints {
-            if dup_sampled < OVERREP_SAMPLE {
-                *dup_map.entry(fp).or_insert(0) += 1;
-                dup_sampled += 1;
+        if config.flags.duplication_check {
+            for &fp in &acc.fingerprints {
+                if dup_sampled < OVERREP_SAMPLE {
+                    *dup_map.entry(fp).or_insert(0) += 1;
+                    dup_sampled += 1;
+                }
             }
         }
         if !acc.kmer_seqs.is_empty() {
-            for seq in &acc.kmer_seqs {
-                if overrep_sampled < OVERREP_SAMPLE {
-                    let mut key = [0u8; 50];
-                    let n = seq.len().min(50);
-                    key[..n].copy_from_slice(&seq[..n]);
-                    *overrep_map.entry(key).or_insert(0) += 1;
-                    overrep_sampled += 1;
+            if config.flags.overrep_sequences {
+                for seq in &acc.kmer_seqs {
+                    if overrep_sampled < OVERREP_SAMPLE {
+                        let mut key = [0u8; 50];
+                        let n = seq.len().min(50);
+                        key[..n].copy_from_slice(&seq[..n]);
+                        *overrep_map.entry(key).or_insert(0) += 1;
+                        overrep_sampled += 1;
+                    }
                 }
             }
-            let kmers = count_kmers_parallel(&acc.kmer_seqs);
-            for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            if config.flags.kmer_analysis {
+                let kmers = count_kmers_parallel(&acc.kmer_seqs);
+                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            }
         }
 
         if config.trim_output {
@@ -728,9 +752,9 @@ fn process_single_file_mmap(
         for i in 0..crate::types::MAX_QUAL_POSITION {
             quality_by_pos[i].0 += acc.quality_by_pos[i].0;
             quality_by_pos[i].1 += acc.quality_by_pos[i].1;
-            for j in 0..5 { base_composition[i][j] += acc.base_composition[i][j]; }
+            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) { *lhs += rhs; }
         }
-        for i in 0..PHRED_BUCKETS { quality_distribution[i] += acc.quality_distribution[i]; }
+        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) { *lhs += rhs; }
         for (k, v) in acc.per_tile { let e = per_tile.entry(k).or_insert((0,0)); e.0+=v.0; e.1+=v.1; }
 
         flush_counter += acc.read_count;
@@ -751,7 +775,7 @@ fn process_single_file_mmap(
                 cur.max_length        = max_length;
                 cur.bytes_processed   = bytes.min(file_size);
             }
-            if total_flushed % 500_000 == 0 {
+            if total_flushed.is_multiple_of(500_000) {
                 let elapsed = s.elapsed_secs();
                 let rps  = if elapsed > 0.0 { read_count as f64 / elapsed } else { 0.0 };
                 let mbps = if elapsed > 0.0 { bytes as f64 / 1_048_576.0 / elapsed } else { 0.0 };
@@ -939,18 +963,23 @@ fn process_paired_files(
         bytes += batch_bytes;
 
         // Process R1+R2 together in parallel — each pair is one unit
+        let per_tile_enabled = config.flags.per_tile_quality;
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, |mut acc, (r1, r2)| {
+            .fold(BatchAccum::default, move |mut acc, (r1, r2)| {
                 for rec in [r1, r2] {
                     let (eff_seq, eff_qual, adapter_hit) =
                         trim_record(&rec.seq, rec.qual.as_deref(), config);
-                    let tile_info = parse_illumina_tile(&rec.id).and_then(|tile_id| {
-                        eff_qual.map(|q| {
-                            let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
-                            (tile_id, phred_sum, q.len() as u64)
+                    let tile_info = if per_tile_enabled {
+                        parse_illumina_tile(&rec.id).and_then(|tile_id| {
+                            eff_qual.map(|q| {
+                                let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                                (tile_id, phred_sum, q.len() as u64)
+                            })
                         })
-                    });
+                    } else {
+                        None
+                    };
                     let fp = fingerprint(eff_seq);
                     acc.process(eff_seq, eff_qual, tile_info, fp, adapter_hit);
                 }
@@ -959,24 +988,30 @@ fn process_paired_files(
             .reduce(BatchAccum::default, BatchAccum::merge);
 
         // Dedup + overrep
-        for &fp in &acc.fingerprints {
-            if dup_sampled_pe < OVERREP_SAMPLE {
-                *dup_map_pe.entry(fp).or_insert(0) += 1;
-                dup_sampled_pe += 1;
+        if config.flags.duplication_check {
+            for &fp in &acc.fingerprints {
+                if dup_sampled_pe < OVERREP_SAMPLE {
+                    *dup_map_pe.entry(fp).or_insert(0) += 1;
+                    dup_sampled_pe += 1;
+                }
             }
         }
         if !acc.kmer_seqs.is_empty() {
-            for seq in &acc.kmer_seqs {
-                if overrep_sampled_pe < OVERREP_SAMPLE {
-                    let mut key = [0u8; 50];
-                    let n = seq.len().min(50);
-                    key[..n].copy_from_slice(&seq[..n]);
-                    *overrep_map_pe.entry(key).or_insert(0) += 1;
-                    overrep_sampled_pe += 1;
+            if config.flags.overrep_sequences {
+                for seq in &acc.kmer_seqs {
+                    if overrep_sampled_pe < OVERREP_SAMPLE {
+                        let mut key = [0u8; 50];
+                        let n = seq.len().min(50);
+                        key[..n].copy_from_slice(&seq[..n]);
+                        *overrep_map_pe.entry(key).or_insert(0) += 1;
+                        overrep_sampled_pe += 1;
+                    }
                 }
             }
-            let kmers = count_kmers_parallel(&acc.kmer_seqs);
-            for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            if config.flags.kmer_analysis {
+                let kmers = count_kmers_parallel(&acc.kmer_seqs);
+                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            }
         }
 
         read_count    += acc.read_count;
@@ -993,9 +1028,9 @@ fn process_paired_files(
         for i in 0..crate::types::MAX_QUAL_POSITION {
             quality_by_pos[i].0 += acc.quality_by_pos[i].0;
             quality_by_pos[i].1 += acc.quality_by_pos[i].1;
-            for j in 0..5 { base_composition[i][j] += acc.base_composition[i][j]; }
+            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) { *lhs += rhs; }
         }
-        for i in 0..PHRED_BUCKETS { quality_distribution[i] += acc.quality_distribution[i]; }
+        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) { *lhs += rhs; }
         for (k, v) in acc.per_tile { let e = per_tile.entry(k).or_insert((0,0)); e.0+=v.0; e.1+=v.1; }
 
         flush_counter += acc.read_count;
@@ -1016,7 +1051,7 @@ fn process_paired_files(
                 cur.max_length = max_length;
                 cur.bytes_processed = bytes.min(r1_size + r2_size);
             }
-            if total_flushed % 500_000 == 0 {
+            if total_flushed.is_multiple_of(500_000) {
                 let elapsed = s.elapsed_secs();
                 let rps = if elapsed > 0.0 { read_count as f64 / elapsed } else { 0.0 };
                 s.log(LogLevel::Info, format!("{} reads  {:.0} pairs/s", format_number(read_count), rps / 2.0));

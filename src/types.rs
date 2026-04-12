@@ -79,6 +79,40 @@ pub struct OverrepSeq {
     pub possible_source: String,
 }
 
+/// Controls which optional QC modules and outputs are enabled.
+/// All fields default to `true` (everything on).
+#[derive(Debug, Clone)]
+pub struct FeatureFlags {
+    /// Run k-mer frequency analysis (--no-kmer to disable)
+    pub kmer_analysis: bool,
+    /// Run duplicate read estimation (--no-duplication to disable)
+    pub duplication_check: bool,
+    /// Parse per-tile Illumina quality (--no-per-tile to disable)
+    pub per_tile_quality: bool,
+    /// Detect overrepresented sequences (--no-overrep to disable)
+    pub overrep_sequences: bool,
+    /// Run adapter content analysis (--no-adapter to disable)
+    pub adapter_detection: bool,
+    /// Write HTML report (--no-html to disable)
+    pub html_report: bool,
+    /// Write JSON report (--no-json to disable)
+    pub json_report: bool,
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self {
+            kmer_analysis: true,
+            duplication_check: true,
+            per_tile_quality: true,
+            overrep_sequences: true,
+            adapter_detection: true,
+            html_report: true,
+            json_report: true,
+        }
+    }
+}
+
 /// Configuration passed to the processing engine.
 #[derive(Clone)]
 pub struct ProcessConfig {
@@ -97,6 +131,8 @@ pub struct ProcessConfig {
     /// If set, treat input as paired-end: this is the R2 file path.
     /// The primary input file is R1.
     pub paired_end_r2: Option<String>,
+    /// Feature flags controlling which QC modules and outputs are active
+    pub flags: FeatureFlags,
 }
 
 impl Default for ProcessConfig {
@@ -109,6 +145,7 @@ impl Default for ProcessConfig {
             quality_trim_threshold: 0,
             strict: false,
             paired_end_r2: None,
+            flags: FeatureFlags::default(),
         }
     }
 }
@@ -251,7 +288,7 @@ impl FileStats {
         // Sort descending by length
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
-        let n50_thresh = (self.total_bases + 1) / 2;
+        let n50_thresh = self.total_bases.div_ceil(2);
         let n90_thresh = self.total_bases * 9 / 10;
 
         let mut cumsum = 0u64;
@@ -444,7 +481,7 @@ pub fn format_number(n: u64) -> String {
     for (i, &b) in bytes.iter().enumerate() {
         result.push(b as char);
         let remaining = len - i - 1;
-        if remaining > 0 && remaining % 3 == 0 {
+        if remaining > 0 && remaining.is_multiple_of(3) {
             result.push(',');
         }
     }

@@ -12,7 +12,7 @@ use crossterm::event::{self, Event, KeyCode};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, LeaveAlternateScreen};
 
-use types::{format_number, ProcessConfig, ProcessingStatus, SharedState};
+use types::{format_number, FeatureFlags, ProcessConfig, ProcessingStatus, SharedState};
 
 // ---------------------------------------------------------------------------
 // CLI
@@ -21,7 +21,7 @@ use types::{format_number, ProcessConfig, ProcessingStatus, SharedState};
 fn print_help() {
     eprintln!(
         r#"
-BioFastq-A v2.1.0 — High-performance FASTQ/FASTA quality analysis
+BioFastq-A {} — High-performance FASTQ/FASTA quality analysis
 
 USAGE:
   biofastq-a [OPTIONS] <file> [<file2> ...]
@@ -45,7 +45,19 @@ OPTIONS:
   --version, -V       Print version and exit
   --help, -h          Show this help message
 
-OUTPUT:
+QC MODULE TOGGLES:
+  --no-kmer           Skip k-mer frequency analysis (faster, less memory)
+  --no-duplication    Skip duplicate read estimation (faster, less memory)
+  --no-per-tile       Skip per-tile quality analysis (non-Illumina data)
+  --no-overrep        Skip overrepresented sequence detection
+  --no-adapter        Skip adapter content analysis
+  --fast              Quick mode: disables kmer, duplication, per-tile, overrep
+
+OUTPUT OPTIONS:
+  --no-html           Skip HTML report generation
+  --no-json           Skip JSON report generation
+
+OUTPUT FILES:
   <stem>_report.html      Self-contained HTML report with interactive charts
   <stem>_report.json      Machine-readable JSON report
   <stem>_trimmed.fastq.gz Adapter-trimmed reads (when --trim is used)
@@ -54,8 +66,10 @@ EXAMPLES:
   biofastq-a sample.fastq
   biofastq-a reads.fastq.gz --trim --output-dir ./qc
   biofastq-a *.fastq.gz --headless --output-dir ./reports
-  biofastq-a reads.fasta --headless
-"#
+  biofastq-a reads.fastq.gz --fast --no-html
+  biofastq-a reads.fasta --no-per-tile --no-kmer
+"#,
+        env!("CARGO_PKG_VERSION")
     );
 }
 
@@ -70,6 +84,15 @@ struct CliConfig {
     strict: bool,
     threads: Option<usize>,
     paired_r2: Option<String>,
+    // Feature flags
+    no_kmer: bool,
+    no_duplication: bool,
+    no_per_tile: bool,
+    no_overrep: bool,
+    no_adapter: bool,
+    no_html: bool,
+    no_json: bool,
+    fast: bool,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -95,6 +118,14 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut strict = false;
     let mut threads: Option<usize> = None;
     let mut paired_r2: Option<String> = None;
+    let mut no_kmer = false;
+    let mut no_duplication = false;
+    let mut no_per_tile = false;
+    let mut no_overrep = false;
+    let mut no_adapter = false;
+    let mut no_html = false;
+    let mut no_json = false;
+    let mut fast = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -134,6 +165,14 @@ fn parse_args() -> Result<CliConfig, String> {
                     .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
             }
             "--strict" => strict = true,
+            "--no-kmer" => no_kmer = true,
+            "--no-duplication" => no_duplication = true,
+            "--no-per-tile" => no_per_tile = true,
+            "--no-overrep" => no_overrep = true,
+            "--no-adapter" => no_adapter = true,
+            "--no-html" => no_html = true,
+            "--no-json" => no_json = true,
+            "--fast" => fast = true,
             "--in2" => {
                 i += 1;
                 if i >= args.len() {
@@ -177,6 +216,14 @@ fn parse_args() -> Result<CliConfig, String> {
         strict,
         threads,
         paired_r2,
+        no_kmer,
+        no_duplication,
+        no_per_tile,
+        no_overrep,
+        no_adapter,
+        no_html,
+        no_json,
+        fast,
     })
 }
 
@@ -280,6 +327,16 @@ fn main() {
         std::process::exit(1);
     }
 
+    let flags = FeatureFlags {
+        kmer_analysis:    !(cfg.no_kmer        || cfg.fast),
+        duplication_check:!(cfg.no_duplication || cfg.fast),
+        per_tile_quality: !(cfg.no_per_tile    || cfg.fast),
+        overrep_sequences:!(cfg.no_overrep     || cfg.fast),
+        adapter_detection: !cfg.no_adapter,
+        html_report:       !cfg.no_html,
+        json_report:       !cfg.no_json,
+    };
+
     let process_config = ProcessConfig {
         trim_output: cfg.trim,
         min_length: cfg.min_length,
@@ -288,6 +345,7 @@ fn main() {
         quality_trim_threshold: cfg.quality_trim,
         strict: cfg.strict,
         paired_end_r2: cfg.paired_r2.clone(),
+        flags,
     };
 
     let n_files = cfg.input_files.len();
@@ -300,6 +358,10 @@ fn main() {
         let _ = execute!(stdout(), LeaveAlternateScreen);
         default_hook(info);
     }));
+
+    // Stash report flags before process_config is moved into the thread
+    let report_html = process_config.flags.html_report;
+    let report_json = process_config.flags.json_report;
 
     // Spawn processing thread
     let state_worker = Arc::clone(&state);
@@ -354,13 +416,17 @@ fn main() {
             for f in snap.all_files() {
                 print_file_summary(f);
             }
-            match report::export_html(&snap, &cfg.output_dir) {
-                Ok(path) => println!("HTML report:  {}", path),
-                Err(e) => eprintln!("Warning: HTML report failed: {}", e),
+            if report_html {
+                match report::export_html(&snap, &cfg.output_dir) {
+                    Ok(path) => println!("HTML report:  {}", path),
+                    Err(e) => eprintln!("Warning: HTML report failed: {}", e),
+                }
             }
-            match report::export_json(&snap, &cfg.output_dir) {
-                Ok(path) => println!("JSON report:  {}", path),
-                Err(e) => eprintln!("Warning: JSON report failed: {}", e),
+            if report_json {
+                match report::export_json(&snap, &cfg.output_dir) {
+                    Ok(path) => println!("JSON report:  {}", path),
+                    Err(e) => eprintln!("Warning: JSON report failed: {}", e),
+                }
             }
             let elapsed = snap.elapsed_secs();
             let total_reads: u64 = snap.all_files().iter().map(|f| f.read_count).sum();

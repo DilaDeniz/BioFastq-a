@@ -138,8 +138,8 @@ impl BatchAccum {
 
             // Per-position quality: cap avoids repeated bounds checks inside the loop.
             let cap = n.min(MAX_QUAL_POSITION);
-            for pos in 0..cap {
-                let phred = q[pos].saturating_sub(33) as u64;
+            for (pos, &b) in q.iter().enumerate().take(cap) {
+                let phred = b.saturating_sub(33) as u64;
                 self.quality_by_pos[pos].0 += phred;
                 self.quality_by_pos[pos].1 += 1;
             }
