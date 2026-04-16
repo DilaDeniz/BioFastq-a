@@ -161,10 +161,15 @@ fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
     m.push(("N content".into(), if max_n_pct < 5.0 { QcStatus::Pass }
         else if max_n_pct < 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
 
-    // Sequence length distribution
+    // Sequence length distribution.
+    // len_range == 0: all reads the same length (classic Illumina) → PASS.
+    // Small range: slight variation from quality trimming → WARN.
+    // Large range (>= 50bp): significant variation; could be long-read data or
+    // heavily-trimmed data — flag it so the user is aware, but don't FAIL since
+    // it is expected for ONT/PacBio or adapter-trimmed libraries.
     let len_range = f.max_length.saturating_sub(f.effective_min_length());
     m.push(("Sequence length".into(), if len_range == 0 { QcStatus::Pass }
-        else if len_range < 50 { QcStatus::Warn } else { QcStatus::Pass }));
+        else { QcStatus::Warn }));
 
     // Sequence duplication level
     m.push(("Duplication level".into(), if f.dup_rate_pct < 20.0 { QcStatus::Pass }

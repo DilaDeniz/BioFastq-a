@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-pub const MAX_QUAL_POSITION: usize = 500;
+/// Maximum read length tracked for per-position quality and base composition.
+/// 2000 covers Illumina (≤300bp), most amplicon data, and medium-length ONT reads.
+/// Positions beyond this cap are still counted in global stats (GC, avg quality)
+/// but are excluded from the per-position charts.
+pub const MAX_QUAL_POSITION: usize = 2000;
 /// How often (in reads) the UI stats panel is refreshed.  Larger = less lock
 /// contention; 100k gives ~1-2 s refresh granularity at 50–100k reads/s.
 pub const FLUSH_INTERVAL: u64    = 100_000;
