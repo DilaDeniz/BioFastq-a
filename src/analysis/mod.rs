@@ -22,12 +22,31 @@ use crate::types::{
 
 use self::io::{open_writer, write_fastq_record};
 use self::kmers::count_kmers_parallel;
-use self::metrics::{fingerprint, BatchAccum};
+use self::metrics::{fingerprint, merge_batch_into_totals, BatchAccum};
 use self::mmap_reader::RecordRange;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Strip FASTQ/FASTA extensions from a file path to produce a clean output stem.
+/// Handles: .fastq, .fq, .fastq.gz, .fq.gz, .fasta, .fa, .fasta.gz, .fa.gz
+fn output_stem(path: &str) -> String {
+    let p = Path::new(path);
+    // First strip .gz if present
+    let without_gz = if path.ends_with(".gz") {
+        p.file_stem().and_then(|s| s.to_str()).unwrap_or(path)
+    } else {
+        p.file_name().and_then(|s| s.to_str()).unwrap_or(path)
+    };
+    // Then strip the biological extension
+    for ext in &[".fastq", ".fq", ".fasta", ".fa"] {
+        if let Some(s) = without_gz.strip_suffix(ext) {
+            return s.to_string();
+        }
+    }
+    without_gz.to_string()
+}
 
 /// Apply quality trim + adapter clip to a record, returning effective slices.
 #[inline]
@@ -129,10 +148,13 @@ fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
     m.push(("Per-base sequence content".into(), if very_unbalanced { QcStatus::Fail }
         else if unbalanced { QcStatus::Warn } else { QcStatus::Pass }));
 
-    // GC content
+    // GC content — thresholds are deliberately wide: many organisms (bacteria,
+    // fungi, AT-rich parasites) fall well outside the mammalian 40–60% range.
+    // We only flag extreme values that suggest severe contamination or a
+    // sequencing artifact rather than simply a non-model organism.
     let gc = f.gc_content();
-    m.push(("GC content".into(), if (40.0..=60.0).contains(&gc) { QcStatus::Pass }
-        else if (30.0..=70.0).contains(&gc) { QcStatus::Warn } else { QcStatus::Fail }));
+    m.push(("GC content".into(), if (20.0..=80.0).contains(&gc) { QcStatus::Pass }
+        else if (10.0..=90.0).contains(&gc) { QcStatus::Warn } else { QcStatus::Fail }));
 
     // N content — max N% at any position
     let max_n_pct = bcomp.iter().map(|p| p[4]).fold(0.0_f64, f64::max);
@@ -234,13 +256,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
     let trim_path = config.trim_output.then(|| {
-        let stem = Path::new(&file_path)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("output")
-            .trim_end_matches(".fastq")
-            .to_string();
-        format!("{}/{}_trimmed.fastq.gz", config.output_dir, stem)
+        format!("{}/{}_trimmed.fastq.gz", config.output_dir, output_stem(&file_path))
     });
 
     {
@@ -444,34 +460,14 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         }
 
         // --- Merge batch accumulator into running totals ---
-        read_count    += acc.read_count;
-        total_bases   += acc.total_bases;
-        gc_count      += acc.gc_count;
-        quality_sum   += acc.quality_sum;
-        quality_bases += acc.quality_bases;
-        q20_bases     += acc.q20_bases;
-        q30_bases     += acc.q30_bases;
-        adapter_hits  += acc.adapter_hits;
-        if acc.min_length < min_length { min_length = acc.min_length; }
-        if acc.max_length > max_length { max_length = acc.max_length; }
-        for (k, v) in acc.length_histogram {
-            *length_histogram.entry(k).or_insert(0) += v;
-        }
-        for i in 0..crate::types::MAX_QUAL_POSITION {
-            quality_by_pos[i].0    += acc.quality_by_pos[i].0;
-            quality_by_pos[i].1    += acc.quality_by_pos[i].1;
-            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) {
-                *lhs += rhs;
-            }
-        }
-        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) {
-            *lhs += rhs;
-        }
-        for (k, v) in acc.per_tile {
-            let e = per_tile.entry(k).or_insert((0, 0));
-            e.0 += v.0;
-            e.1 += v.1;
-        }
+        merge_batch_into_totals(
+            &acc,
+            &mut read_count, &mut total_bases, &mut gc_count,
+            &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
+            &mut adapter_hits, &mut min_length, &mut max_length,
+            &mut length_histogram, &mut quality_by_pos,
+            &mut base_composition, &mut quality_distribution, &mut per_tile,
+        );
 
         // --- Periodic UI flush ---
         flush_counter += acc.read_count;
@@ -738,24 +734,14 @@ fn process_single_file_mmap(
             }
         }
 
-        read_count    += acc.read_count;
-        total_bases   += acc.total_bases;
-        gc_count      += acc.gc_count;
-        quality_sum   += acc.quality_sum;
-        quality_bases += acc.quality_bases;
-        q20_bases     += acc.q20_bases;
-        q30_bases     += acc.q30_bases;
-        adapter_hits  += acc.adapter_hits;
-        if acc.min_length < min_length { min_length = acc.min_length; }
-        if acc.max_length > max_length { max_length = acc.max_length; }
-        for (k, v) in acc.length_histogram { *length_histogram.entry(k).or_insert(0) += v; }
-        for i in 0..crate::types::MAX_QUAL_POSITION {
-            quality_by_pos[i].0 += acc.quality_by_pos[i].0;
-            quality_by_pos[i].1 += acc.quality_by_pos[i].1;
-            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) { *lhs += rhs; }
-        }
-        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) { *lhs += rhs; }
-        for (k, v) in acc.per_tile { let e = per_tile.entry(k).or_insert((0,0)); e.0+=v.0; e.1+=v.1; }
+        merge_batch_into_totals(
+            &acc,
+            &mut read_count, &mut total_bases, &mut gc_count,
+            &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
+            &mut adapter_hits, &mut min_length, &mut max_length,
+            &mut length_histogram, &mut quality_by_pos,
+            &mut base_composition, &mut quality_distribution, &mut per_tile,
+        );
 
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {
@@ -865,11 +851,7 @@ fn process_paired_files(
         let mut s = state.lock().unwrap();
         let mut stats = FileStats::new(r1_path.clone(), r1_size + r2_size);
         stats.trim_output_path = config.trim_output.then(|| {
-            let stem = Path::new(&r1_path)
-                .file_stem().and_then(|s| s.to_str())
-                .unwrap_or("r1")
-                .trim_end_matches(".fastq").to_string();
-            format!("{}/{}_trimmed.fastq.gz", config.output_dir, stem)
+            format!("{}/{}_trimmed.fastq.gz", config.output_dir, output_stem(&r1_path))
         });
         s.current = Some(stats);
     }
@@ -1014,24 +996,14 @@ fn process_paired_files(
             }
         }
 
-        read_count    += acc.read_count;
-        total_bases   += acc.total_bases;
-        gc_count      += acc.gc_count;
-        quality_sum   += acc.quality_sum;
-        quality_bases += acc.quality_bases;
-        q20_bases     += acc.q20_bases;
-        q30_bases     += acc.q30_bases;
-        adapter_hits  += acc.adapter_hits;
-        if acc.min_length < min_length { min_length = acc.min_length; }
-        if acc.max_length > max_length { max_length = acc.max_length; }
-        for (k, v) in acc.length_histogram { *length_histogram.entry(k).or_insert(0) += v; }
-        for i in 0..crate::types::MAX_QUAL_POSITION {
-            quality_by_pos[i].0 += acc.quality_by_pos[i].0;
-            quality_by_pos[i].1 += acc.quality_by_pos[i].1;
-            for (lhs, &rhs) in base_composition[i].iter_mut().zip(acc.base_composition[i].iter()) { *lhs += rhs; }
-        }
-        for (lhs, &rhs) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) { *lhs += rhs; }
-        for (k, v) in acc.per_tile { let e = per_tile.entry(k).or_insert((0,0)); e.0+=v.0; e.1+=v.1; }
+        merge_batch_into_totals(
+            &acc,
+            &mut read_count, &mut total_bases, &mut gc_count,
+            &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
+            &mut adapter_hits, &mut min_length, &mut max_length,
+            &mut length_histogram, &mut quality_by_pos,
+            &mut base_composition, &mut quality_distribution, &mut per_tile,
+        );
 
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {

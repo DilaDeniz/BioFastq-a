@@ -202,6 +202,62 @@ impl BatchAccum {
 }
 
 // ---------------------------------------------------------------------------
+// Running-totals helper — called after every batch in all three processing paths
+// ---------------------------------------------------------------------------
+
+/// Merge a finished `BatchAccum` into the flat running-total variables that
+/// accumulate across the whole file.  Extracted here to avoid copy-pasting
+/// ~20 lines into each of the three processing functions in `mod.rs`.
+#[allow(clippy::too_many_arguments)]
+pub fn merge_batch_into_totals(
+    acc: &BatchAccum,
+    read_count:    &mut u64,
+    total_bases:   &mut u64,
+    gc_count:      &mut u64,
+    quality_sum:   &mut u64,
+    quality_bases: &mut u64,
+    q20_bases:     &mut u64,
+    q30_bases:     &mut u64,
+    adapter_hits:  &mut u64,
+    min_length:    &mut u64,
+    max_length:    &mut u64,
+    length_histogram: &mut std::collections::HashMap<u64, u64>,
+    quality_by_pos:   &mut Vec<(u64, u64)>,
+    base_composition: &mut Vec<[u64; 5]>,
+    quality_distribution: &mut Vec<u64>,
+    per_tile: &mut std::collections::HashMap<u32, (u64, u64)>,
+) {
+    *read_count    += acc.read_count;
+    *total_bases   += acc.total_bases;
+    *gc_count      += acc.gc_count;
+    *quality_sum   += acc.quality_sum;
+    *quality_bases += acc.quality_bases;
+    *q20_bases     += acc.q20_bases;
+    *q30_bases     += acc.q30_bases;
+    *adapter_hits  += acc.adapter_hits;
+    if acc.min_length < *min_length { *min_length = acc.min_length; }
+    if acc.max_length > *max_length { *max_length = acc.max_length; }
+    for (&k, &v) in &acc.length_histogram {
+        *length_histogram.entry(k).or_insert(0) += v;
+    }
+    for i in 0..MAX_QUAL_POSITION {
+        quality_by_pos[i].0 += acc.quality_by_pos[i].0;
+        quality_by_pos[i].1 += acc.quality_by_pos[i].1;
+        for j in 0..5 {
+            base_composition[i][j] += acc.base_composition[i][j];
+        }
+    }
+    for i in 0..PHRED_BUCKETS {
+        quality_distribution[i] += acc.quality_distribution[i];
+    }
+    for (&k, &v) in &acc.per_tile {
+        let e = per_tile.entry(k).or_insert((0, 0));
+        e.0 += v.0;
+        e.1 += v.1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Legacy helpers (still used for sequential trim-mode processing)
 // ---------------------------------------------------------------------------
 

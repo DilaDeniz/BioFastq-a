@@ -115,10 +115,13 @@ fn trim_len(buf: &[u8], raw_end: usize) -> usize {
 // ---------------------------------------------------------------------------
 
 /// Count G+C bases in a sequence slice using SIMD memchr.
+/// Handles both uppercase and lowercase bases (mmap reader does not normalize case).
 #[inline]
 pub fn count_gc_simd(seq: &[u8]) -> u64 {
     (memchr::memchr_iter(b'G', seq).count()
-        + memchr::memchr_iter(b'C', seq).count()) as u64
+        + memchr::memchr_iter(b'C', seq).count()
+        + memchr::memchr_iter(b'g', seq).count()
+        + memchr::memchr_iter(b'c', seq).count()) as u64
 }
 
 /// Count N bases.
