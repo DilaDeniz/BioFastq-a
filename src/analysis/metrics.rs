@@ -36,6 +36,8 @@ pub struct BatchAccum {
     pub fingerprints: Vec<u64>,
     /// Average quality bucketed by read length (bin = len / 100bp).
     pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
+    /// Per-read GC content histogram: index = GC% (0..=100).
+    pub gc_per_read: [u64; 101],
 }
 
 impl Default for BatchAccum {
@@ -60,6 +62,7 @@ impl Default for BatchAccum {
             kmer_seqs: Vec::new(),
             fingerprints: Vec::new(),
             quality_by_length_bin: HashMap::new(),
+            gc_per_read: [0u64; 101],
         }
     }
 }
@@ -87,7 +90,12 @@ impl BatchAccum {
 
         if adapter_hit { self.adapter_hits += 1; }
 
-        self.gc_count += count_gc_simd(seq);
+        let gc_this = count_gc_simd(seq);
+        self.gc_count += gc_this;
+        if len > 0 {
+            let gc_pct = (gc_this * 100 / len).min(100) as usize;
+            self.gc_per_read[gc_pct] += 1;
+        }
 
         let end = seq.len().min(MAX_QUAL_POSITION);
         for pos in 0..end {
@@ -179,6 +187,9 @@ impl BatchAccum {
             let e = self.quality_by_length_bin.entry(k).or_insert((0, 0));
             e.0 += v.0;
             e.1 += v.1;
+        }
+        for (dst, &src) in self.gc_per_read.iter_mut().zip(other.gc_per_read.iter()) {
+            *dst += src;
         }
         self.kmer_seqs.extend(other.kmer_seqs);
         self.fingerprints.extend(other.fingerprints);

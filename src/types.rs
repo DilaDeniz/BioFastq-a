@@ -203,6 +203,10 @@ pub struct FileStats {
     pub overrepresented_sequences: Vec<OverrepSeq>,
     // Per-module QC pass/warn/fail status (FastQC-style traffic lights)
     pub module_status: Vec<(String, QcStatus)>,
+    // Per-read GC content histogram: index = GC% (0..=100), value = read count
+    pub gc_distribution: Vec<u64>,
+    // Duplication level histogram: percentage of reads at each duplication level (9 bins)
+    pub dup_level_histogram: Vec<f64>,
 }
 
 impl FileStats {
@@ -236,6 +240,8 @@ impl FileStats {
             trimmed_by_adapter: HashMap::new(),
             overrepresented_sequences: Vec::new(),
             module_status: Vec::new(),
+            gc_distribution: vec![0u64; 101],
+            dup_level_histogram: vec![0.0; 9],
         }
     }
 

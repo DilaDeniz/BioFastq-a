@@ -598,11 +598,144 @@ function drawQualDist(id, data) {
   ctx.fillText('Mean Phred score per read', pad.l+pw/2, H-2);
 }
 
+/* ---------- GC content distribution ---------- */
+function drawGcDist(id, data, meanGc) {
+  var cv=document.getElementById(id); if(!cv||!data||!data.length)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var pad={l:52,r:16,t:24,b:36};
+  var pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+  var total=data.reduce(function(s,v){return s+v;},0)||1;
+  var max=Math.max.apply(null,data)||1;
+  var n=data.length, bw=pw/n;
+  // Draw bars
+  data.forEach(function(cnt,gc){
+    var frac=cnt/max;
+    var barH=ph*frac;
+    ctx.fillStyle='rgba(26,95,168,0.55)';
+    ctx.fillRect(pad.l+gc*bw, pad.t+ph-barH, Math.max(1,bw-1), barH);
+  });
+  // Theoretical normal overlay
+  if (meanGc >= 0) {
+    var variance = 0;
+    data.forEach(function(cnt,gc){variance += cnt*(gc-meanGc)*(gc-meanGc);});
+    variance /= total;
+    var sd = Math.sqrt(variance) || 5;
+    ctx.beginPath();
+    var peaked = false;
+    for (var gc=0; gc<=100; gc++) {
+      var norm = Math.exp(-0.5*((gc-meanGc)/sd)*((gc-meanGc)/sd));
+      var x=pad.l+(gc+0.5)*bw;
+      var y=pad.t+ph*(1-norm);
+      if(!peaked){ctx.moveTo(x,y);peaked=true;}else{ctx.lineTo(x,y);}
+    }
+    ctx.strokeStyle='rgba(220,53,69,0.7)'; ctx.lineWidth=2;
+    ctx.setLineDash([4,3]); ctx.stroke(); ctx.setLineDash([]);
+  }
+  // Axes
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='center';
+  [0,20,40,50,60,80,100].forEach(function(g){ctx.fillText(g+'%',pad.l+g*bw,H-pad.b+14);});
+  ctx.fillText('GC Content (%)', pad.l+pw/2, H-2);
+  // Legend
+  ctx.textAlign='left'; ctx.font='10px monospace';
+  ctx.fillStyle='rgba(26,95,168,0.55)'; ctx.fillRect(pad.l+4,pad.t+4,12,8);
+  ctx.fillStyle='#5a6370'; ctx.fillText('Observed',pad.l+19,pad.t+12);
+  ctx.strokeStyle='rgba(220,53,69,0.7)'; ctx.lineWidth=2; ctx.setLineDash([4,3]);
+  ctx.beginPath(); ctx.moveTo(pad.l+80,pad.t+8); ctx.lineTo(pad.l+94,pad.t+8); ctx.stroke();
+  ctx.setLineDash([]); ctx.fillStyle='#5a6370'; ctx.fillText('Theoretical',pad.l+97,pad.t+12);
+}
+
+/* ---------- Duplication level histogram ---------- */
+function drawDupHist(id, data) {
+  var cv=document.getElementById(id); if(!cv||!data||!data.length)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var pad={l:52,r:16,t:20,b:50};
+  var pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+  var max=Math.max.apply(null,data.map(function(d){return d[1];}));
+  if(!max) return;
+  var n=data.length, bw=pw/n;
+  data.forEach(function(d,i){
+    var frac=d[1]/max;
+    var barH=ph*frac;
+    var t=i/(n-1||1);
+    var r=Math.round(26*(1-t)+220*t), g=Math.round(95*(1-t)+53*t), b=Math.round(168*(1-t)+69*t);
+    ctx.fillStyle='rgba('+r+','+g+','+b+',0.75)';
+    ctx.fillRect(pad.l+i*bw+1, pad.t+ph-barH, Math.max(1,bw-2), barH);
+    // label
+    ctx.fillStyle='#5a6370'; ctx.font='10px monospace'; ctx.textAlign='center';
+    ctx.fillText(d[0], pad.l+(i+0.5)*bw, H-pad.b+14);
+    if(d[1]>0.5){ctx.fillText(d[1].toFixed(1)+'%', pad.l+(i+0.5)*bw, pad.t+ph-barH-4);}
+  });
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+  ctx.fillStyle='#5a6370'; ctx.font='10px monospace'; ctx.textAlign='right';
+  [0,50,100].forEach(function(p){
+    var y=pad.t+ph*(1-p/100);
+    ctx.fillText(p+'%',pad.l-4,y+4);
+  });
+  ctx.textAlign='center'; ctx.fillText('Duplication level', pad.l+pw/2, H-2);
+}
+
+/* ---------- Per-base N content ---------- */
+function drawNContent(id, data) {
+  var cv=document.getElementById(id); if(!cv||!data||!data.length)return;
+  var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
+  var pad={l:52,r:16,t:20,b:36};
+  var pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+  var maxN=Math.max.apply(null,data)||0.1;
+  var cap=Math.max(5,Math.ceil(maxN));
+  // warn zone
+  ctx.fillStyle='rgba(220,53,69,.06)'; ctx.fillRect(pad.l,pad.t,pw,ph);
+  // line
+  ctx.beginPath();
+  data.forEach(function(v,i){
+    var x=pad.l+(i/(data.length-1||1))*pw;
+    var y=pad.t+ph*(1-v/cap);
+    if(i===0)ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.strokeStyle='#dc3545'; ctx.lineWidth=1.5; ctx.stroke();
+  // 5% threshold line
+  if(cap>=5){
+    var ty=pad.t+ph*(1-5/cap);
+    ctx.setLineDash([3,4]); ctx.strokeStyle='rgba(220,53,69,.4)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,ty); ctx.lineTo(W-pad.r,ty); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle='rgba(220,53,69,.6)'; ctx.font='10px monospace'; ctx.textAlign='right';
+    ctx.fillText('5%',pad.l-4,ty+4);
+  }
+  // Axes
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='right';
+  [0,cap/2,cap].forEach(function(v){
+    ctx.fillText(v.toFixed(1)+'%',pad.l-4,pad.t+ph*(1-v/cap)+4);
+  });
+  ctx.textAlign='center';
+  var n=data.length;
+  var step=n>300?100:n>150?50:n>50?25:10;
+  for(var i=0;i<n;i+=step){ctx.fillText(i+1,pad.l+(i/(n-1||1))*pw,H-pad.b+14);}
+  ctx.fillText(n,pad.l+pw,H-pad.b+14);
+  ctx.fillText('Position (bp)',pad.l+pw/2,H-2);
+  ctx.save(); ctx.translate(10,pad.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('N content (%)',0,0); ctx.restore();
+}
+
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
+    var gc_mean = f.gc_dist ? (function(){
+      var tot=f.gc_dist.reduce(function(s,v){return s+v;},0)||1;
+      var s=0; f.gc_dist.forEach(function(c,g){s+=c*g;}); return s/tot;
+    })() : -1;
     drawQual('qual-'+i, f.qual, f.qual_pct);
     drawLen('len-'+i, f.len);
+    drawGcDist('gcdist-'+i, f.gc_dist, gc_mean);
+    drawDupHist('duphist-'+i, f.dup_hist);
+    drawNContent('ncontent-'+i, f.n_content);
     drawKmer('kmer-'+i, f.kmers);
     drawBaseComp('basecomp-'+i, f.basecomp);
     drawQualDist('qualdist-'+i, f.qualdist);
@@ -974,6 +1107,59 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
 
     s.push_str("</div>\n"); // charts-row (row 4)
 
+    // Row 5: GC distribution + duplication histogram + N content
+    s.push_str("<div class=\"charts-row\">\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
+    s.push_str("<h3>GC Content Distribution</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('gcdist-{idx}','gc_distribution')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
+    s.push_str(&format!(
+        "<canvas id=\"gcdist-{}\" width=\"600\" height=\"240\"></canvas>\n", idx
+    ));
+    s.push_str("<p class=\"chart-note\">Per-read GC content histogram (blue). Red dashed curve = theoretical normal distribution fitted to observed mean and SD. Deviation from normal may indicate contamination or adapter dimers.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
+    s.push_str("<h3>Duplication Level</h3>\n");
+    if flags.duplication_check {
+        s.push_str(&format!(
+            "<button class=\"dl-btn no-print\" onclick=\"downloadChart('duphist-{idx}','dup_level_histogram')\">&#8595; PNG</button>\n",
+            idx = idx
+        ));
+    }
+    s.push_str("</div>\n");
+    if flags.duplication_check {
+        s.push_str(&format!(
+            "<canvas id=\"duphist-{}\" width=\"600\" height=\"240\"></canvas>\n", idx
+        ));
+        s.push_str("<p class=\"chart-note\">Percentage of reads at each duplication level, estimated from first 200,000 read fingerprints. High counts in 2x+ bins indicate library over-amplification.</p>\n");
+    } else {
+        s.push_str(&skipped_notice("--no-duplication / --fast"));
+    }
+    s.push_str("</div>\n");
+
+    s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
+    s.push_str("<h3>Per-Base N Content</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('ncontent-{idx}','n_content')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
+    s.push_str(&format!(
+        "<canvas id=\"ncontent-{}\" width=\"600\" height=\"240\"></canvas>\n", idx
+    ));
+    s.push_str("<p class=\"chart-note\">Percentage of uncalled bases (N) per read position. Red dashed line = 5% warning threshold. Spikes at read ends are common for some sequencing platforms.</p>\n");
+    s.push_str("</div>\n");
+
+    s.push_str("</div>\n"); // charts-row (row 5)
+
     // Overrepresented sequences table
     s.push_str("<div class=\"chart-box\" style=\"margin-top:16px\">\n");
     s.push_str("<h3>Overrepresented Sequences</h3>\n");
@@ -1107,6 +1293,14 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         .map(|pct| serde_json::json!(pct))
         .collect();
 
+    let gc_dist_json: Vec<u64> = f.gc_distribution.clone();
+    let dup_hist_labels = ["1x","2x","3-4x","5-9x","10-49x","50-99x","100-499x","500-999x",">=1000x"];
+    let dup_hist_json: Vec<serde_json::Value> = f.dup_level_histogram.iter()
+        .enumerate()
+        .map(|(i, &pct)| serde_json::json!([dup_hist_labels[i], pct]))
+        .collect();
+    let n_content_json: Vec<f64> = f.base_composition_pct().iter().map(|p| p[4]).collect();
+
     serde_json::json!({
         "qual": qual_per_pos,
         "qual_pct": qual_pct_json,
@@ -1115,6 +1309,9 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         "tiles": tile_json,
         "basecomp": basecomp_json,
         "qualdist": qualdist_json,
+        "gc_dist": gc_dist_json,
+        "dup_hist": dup_hist_json,
+        "n_content": n_content_json,
     })
 }
 

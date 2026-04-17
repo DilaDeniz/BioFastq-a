@@ -358,6 +358,9 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
     let mut error_occurred = false;
+    let mut gc_distribution = [0u64; 101];
+    let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
+    let mut dup_sample_count = 0usize;
 
     // --- Batch reading loop ---
     loop {
@@ -479,6 +482,19 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             &mut quality_by_length_bin,
         );
 
+        // GC per-read distribution (reuses already-computed per-batch data)
+        for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
+            *dst += src;
+        }
+        // Dup level sample (capped at 200k reads for histogram)
+        if config.flags.duplication_check && dup_sample_count < OVERREP_SAMPLE {
+            for &fp in &acc.fingerprints {
+                if dup_sample_count >= OVERREP_SAMPLE { break; }
+                *dup_sample.entry(fp).or_insert(0) += 1;
+                dup_sample_count += 1;
+            }
+        }
+
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {
             flush_counter = 0;
@@ -549,6 +565,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.quality_by_length_bin = quality_by_length_bin;
         cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
+        cur.gc_distribution = gc_distribution.to_vec();
+        cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
         cur.module_status = compute_module_status(cur);
     }
 
@@ -638,6 +656,9 @@ fn process_single_file_mmap(
     let mut trimmed_by_adapter: HashMap<String, u64> = HashMap::new();
     let mut flush_counter     = 0u64;
     let mut total_flushed     = 0u64;
+    let mut gc_distribution = [0u64; 101];
+    let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
+    let mut dup_sample_count = 0usize;
 
     // Arc<Mmap> shared between the producer thread (via MmapFastq) and the
     // consumer (main thread).  Both deref to &[u8] for zero-copy access.
@@ -758,6 +779,19 @@ fn process_single_file_mmap(
             &mut quality_by_length_bin,
         );
 
+        // GC per-read distribution (reuses already-computed per-batch data)
+        for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
+            *dst += src;
+        }
+        // Dup level sample (capped at 200k reads for histogram)
+        if config.flags.duplication_check && dup_sample_count < OVERREP_SAMPLE {
+            for &fp in &acc.fingerprints {
+                if dup_sample_count >= OVERREP_SAMPLE { break; }
+                *dup_sample.entry(fp).or_insert(0) += 1;
+                dup_sample_count += 1;
+            }
+        }
+
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {
             flush_counter = 0;
@@ -824,6 +858,8 @@ fn process_single_file_mmap(
         cur.quality_by_length_bin = quality_by_length_bin;
         cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
+        cur.gc_distribution = gc_distribution.to_vec();
+        cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
         cur.module_status = compute_module_status(cur);
     }
 
@@ -846,6 +882,20 @@ fn process_single_file_mmap(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn compute_dup_histogram(sample: &HashMap<u64, u32>) -> Vec<f64> {
+    if sample.is_empty() { return vec![0.0; 9]; }
+    let total = sample.values().map(|&c| c as u64).sum::<u64>() as f64;
+    let mut bins = [0u64; 9];
+    for &count in sample.values() {
+        let idx = match count {
+            1 => 0, 2 => 1, 3..=4 => 2, 5..=9 => 3,
+            10..=49 => 4, 50..=99 => 5, 100..=499 => 6, 500..=999 => 7, _ => 8,
+        };
+        bins[idx] += 1;
+    }
+    bins.iter().map(|&c| c as f64 / total * 100.0).collect()
+}
 
 fn parse_illumina_tile(id: &[u8]) -> Option<u32> {
     let s = std::str::from_utf8(id).ok()?;
@@ -923,6 +973,9 @@ fn process_paired_files(
     let mut overrep_sampled_pe = 0usize;
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
+    let mut gc_distribution = [0u64; 101];
+    let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
+    let mut dup_sample_count = 0usize;
 
     // Read both files in lockstep batch by batch
     loop {
@@ -1022,6 +1075,19 @@ fn process_paired_files(
             &mut quality_by_length_bin,
         );
 
+        // GC per-read distribution (reuses already-computed per-batch data)
+        for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
+            *dst += src;
+        }
+        // Dup level sample (capped at 200k reads for histogram)
+        if config.flags.duplication_check && dup_sample_count < OVERREP_SAMPLE {
+            for &fp in &acc.fingerprints {
+                if dup_sample_count >= OVERREP_SAMPLE { break; }
+                *dup_sample.entry(fp).or_insert(0) += 1;
+                dup_sample_count += 1;
+            }
+        }
+
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {
             flush_counter = 0;
@@ -1077,6 +1143,8 @@ fn process_paired_files(
         cur.quality_distribution  = quality_distribution;
         cur.quality_by_length_bin = quality_by_length_bin;
         cur.overrepresented_sequences = overrep_seqs_pe;
+        cur.gc_distribution = gc_distribution.to_vec();
+        cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
         cur.module_status = compute_module_status(cur);
     }
 
