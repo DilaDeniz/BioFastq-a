@@ -407,7 +407,6 @@ impl FileStats {
             .collect()
     }
 
-    #[allow(dead_code)]
     /// Q25, Q50 (median), Q75 per base position — FastQC-style boxplot data.
     /// Returns vec of [q25, q50, q75] in Phred units, trimmed to last covered position.
     pub fn qual_percentiles_per_position(&self) -> Vec<[f64; 3]> {

@@ -178,79 +178,94 @@ pub fn export_multiqc(state: &SharedState, output_dir: &str) -> io::Result<Strin
 // HTML report
 // ---------------------------------------------------------------------------
 
-/// Static CSS embedded in the report (dark GitHub-inspired theme)
+/// Static CSS — clean scientific light theme
 const CSS: &str = r#"
-:root{--bg:#0d1117;--card:#161b22;--card2:#1c2128;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;--green:#3fb950;--yellow:#d29922;--orange:#e3b341;--red:#f85149;--purple:#bc8cff;}
+:root{
+  --bg:#f5f6f7;--card:#ffffff;--card2:#f0f2f4;--border:#d0d5dd;
+  --text:#1a1f2e;--muted:#5a6370;--accent:#1a5fa8;
+  --green:#1a7a3e;--green-bg:#eaf6ee;
+  --yellow:#7a5500;--yellow-bg:#fef9e7;
+  --red:#991b1b;--red-bg:#fef2f2;
+  --section-num:#9ca3af;
+}
 *{box-sizing:border-box;margin:0;padding:0;}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);padding:24px;line-height:1.6;font-size:14px;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);padding:32px 40px;line-height:1.65;font-size:14px;max-width:1400px;margin:0 auto;}
+@media print{body{padding:16px;background:#fff;}.no-print{display:none!important;}.file-section{break-inside:avoid;}.chart-box{break-inside:avoid;}}
 a{color:var(--accent);text-decoration:none;}
-h1{font-size:26px;font-weight:700;color:var(--accent);margin-bottom:4px;}
-h2{font-size:18px;font-weight:600;color:var(--text);margin-bottom:12px;}
-h3{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
-.header{border-bottom:1px solid var(--border);padding-bottom:20px;margin-bottom:28px;}
-.header-meta{color:var(--muted);font-size:13px;margin-top:6px;display:flex;gap:20px;flex-wrap:wrap;}
-.badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:600;background:var(--card2);border:1px solid var(--border);}
-.badge-green{border-color:var(--green);color:var(--green);}
-.badge-yellow{border-color:var(--yellow);color:var(--yellow);}
-.badge-red{border-color:var(--red);color:var(--red);}
+h1{font-size:24px;font-weight:700;color:var(--text);letter-spacing:-.3px;margin-bottom:2px;}
+h2{font-size:16px;font-weight:700;color:var(--text);margin-bottom:14px;padding-bottom:6px;border-bottom:2px solid var(--border);}
+h3{font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;}
+.header{padding-bottom:20px;margin-bottom:28px;border-bottom:2px solid var(--border);display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;}
+.header-left h1 span{color:var(--accent);}
+.header-meta{color:var(--muted);font-size:12px;margin-top:6px;display:flex;gap:16px;flex-wrap:wrap;}
+.header-meta span::before{content:"·";margin-right:8px;color:var(--border);}
+.header-meta span:first-child::before{content:"";}
+.header-actions{display:flex;gap:8px;align-items:center;}
+.btn{display:inline-flex;align-items:center;gap:5px;padding:6px 14px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;}
+.btn:hover{background:var(--card2);border-color:#aab;}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+.btn-primary:hover{background:#145090;}
 /* Summary table */
 .summary-table{width:100%;border-collapse:collapse;margin-bottom:28px;font-size:13px;}
-.summary-table th{background:var(--card2);color:var(--muted);font-weight:600;text-align:left;padding:8px 12px;border:1px solid var(--border);}
-.summary-table td{padding:8px 12px;border:1px solid var(--border);background:var(--card);}
-.summary-table tr:hover td{background:var(--card2);}
+.summary-table th{background:var(--card2);color:var(--muted);font-weight:700;text-align:left;padding:9px 12px;border:1px solid var(--border);font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
+.summary-table td{padding:9px 12px;border:1px solid var(--border);background:var(--card);}
+.summary-table tr:hover td{background:#f0f4f8;}
 /* File section */
-.file-section{border:1px solid var(--border);border-radius:10px;margin-bottom:32px;overflow:hidden;}
-.file-section-header{background:var(--card2);padding:16px 20px;border-bottom:1px solid var(--border);}
-.file-section-header .filename{font-size:16px;font-weight:700;font-family:monospace;color:var(--text);}
+.file-section{background:var(--card);border:1px solid var(--border);border-radius:10px;margin-bottom:32px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.06);}
+.file-section-header{background:var(--card2);padding:14px 20px;border-bottom:1px solid var(--border);}
+.file-section-header .filename{font-size:15px;font-weight:700;font-family:monospace;color:var(--text);}
 .file-section-header .filepath{font-size:11px;color:var(--muted);margin-top:2px;font-family:monospace;}
 .file-body{padding:20px;}
 /* Stats grid */
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:10px;margin-bottom:20px;}
 .stat-card{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:12px 14px;}
-.stat-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;}
-.stat-value{font-size:20px;font-weight:700;font-family:monospace;color:var(--text);}
+.stat-label{font-size:10px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px;}
+.stat-value{font-size:19px;font-weight:700;font-family:monospace;color:var(--text);}
 .stat-value.pass{color:var(--green);}
 .stat-value.warn{color:var(--yellow);}
 .stat-value.fail{color:var(--red);}
 /* Charts */
 .charts-row{display:grid;grid-template-columns:repeat(auto-fit,minmax(380px,1fr));gap:16px;margin-bottom:16px;}
-.chart-box{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:16px;}
+.chart-box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px;}
 .chart-box canvas{max-width:100%;display:block;}
-.chart-note{font-size:11px;color:var(--muted);margin-top:6px;}
+.chart-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;}
+.chart-header h3{margin-bottom:0;}
+.chart-note{font-size:11px;color:var(--muted);margin-top:8px;line-height:1.5;}
+.dl-btn{display:inline-flex;align-items:center;gap:3px;padding:3px 8px;border-radius:4px;border:1px solid var(--border);background:var(--card2);color:var(--muted);font-size:10px;font-weight:600;cursor:pointer;white-space:nowrap;}
+.dl-btn:hover{background:var(--border);color:var(--text);}
 /* Adapter section */
 .adapter-grid{display:grid;grid-template-columns:auto 1fr;gap:24px;align-items:start;}
-.big-pct{font-size:40px;font-weight:700;font-family:monospace;line-height:1;}
+.big-pct{font-size:38px;font-weight:700;font-family:monospace;line-height:1;}
 .adapter-list{margin-top:8px;padding:0;}
 .adapter-list li{list-style:none;font-size:12px;font-family:monospace;color:var(--muted);padding:2px 0;}
-.adapter-list li::before{content:"▸ ";color:var(--accent);}
+.adapter-list li::before{content:"› ";color:var(--accent);}
 /* Duplication gauge */
 .dup-gauge-wrap{display:flex;align-items:center;gap:16px;}
-.dup-gauge-track{flex:1;height:16px;background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;}
-.dup-gauge-fill{height:100%;border-radius:8px;transition:width .3s;}
-/* Per-tile table */
-.tile-table{width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;}
-.tile-table th{background:var(--card2);color:var(--muted);padding:5px 10px;text-align:left;border:1px solid var(--border);}
-.tile-table td{padding:4px 10px;border:1px solid var(--border);}
+.dup-gauge-track{flex:1;height:12px;background:var(--card2);border:1px solid var(--border);border-radius:6px;overflow:hidden;}
+.dup-gauge-fill{height:100%;border-radius:6px;}
 /* Trim info */
 .trim-box{background:var(--card2);border:1px solid var(--border);border-radius:8px;padding:16px;}
 .trim-box p{font-size:13px;color:var(--muted);margin:4px 0;}
 .trim-box code{color:var(--accent);font-family:monospace;font-size:12px;}
 /* Footer */
-.footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;padding-top:20px;border-top:1px solid var(--border);}
-/* Module status traffic lights */
+.footer{text-align:center;color:var(--muted);font-size:12px;margin-top:40px;padding-top:16px;border-top:1px solid var(--border);}
+/* Module status badges */
 .module-grid{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:20px;}
-.module-badge{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:6px;border:1px solid var(--border);background:var(--card2);font-size:12px;}
-.module-badge .icon{font-weight:700;font-size:13px;width:16px;text-align:center;}
+.module-badge{display:flex;align-items:center;gap:5px;padding:4px 10px;border-radius:5px;border:1px solid var(--border);background:var(--card2);font-size:11px;font-weight:600;}
+.module-badge .icon{font-size:12px;width:14px;text-align:center;}
+.module-badge.pass{background:var(--green-bg);border-color:#a7d7b8;}
 .module-badge.pass .icon{color:var(--green);}
+.module-badge.warn{background:var(--yellow-bg);border-color:#f0d080;}
 .module-badge.warn .icon{color:var(--yellow);}
+.module-badge.fail{background:var(--red-bg);border-color:#fca5a5;}
 .module-badge.fail .icon{color:var(--red);}
-.module-badge .name{color:var(--muted);}
+.module-badge .name{color:var(--text);}
 /* Overrepresented sequences table */
-.overrep-table{width:100%;border-collapse:collapse;font-size:12px;font-family:monospace;margin-top:8px;}
-.overrep-table th{background:var(--card2);color:var(--muted);padding:6px 10px;text-align:left;border:1px solid var(--border);font-weight:600;}
-.overrep-table td{padding:5px 10px;border:1px solid var(--border);}
-.overrep-table tr:hover td{background:var(--card2);}
-.overrep-seq{word-break:break-all;max-width:320px;color:var(--accent);}
+.overrep-table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px;}
+.overrep-table th{background:var(--card2);color:var(--muted);padding:7px 10px;text-align:left;border:1px solid var(--border);font-weight:700;font-size:11px;text-transform:uppercase;letter-spacing:.04em;}
+.overrep-table td{padding:6px 10px;border:1px solid var(--border);}
+.overrep-table tr:hover td{background:#f0f4f8;}
+.overrep-seq{word-break:break-all;max-width:320px;font-family:monospace;color:var(--accent);font-size:11px;}
 "#;
 
 /// Static JavaScript for chart drawing (uses vanilla Canvas API, no deps)
@@ -258,67 +273,102 @@ const JS: &str = r#"
 'use strict';
 var RD = __REPORT_DATA__;
 
-/* ---------- Quality per position ---------- */
-function drawQual(id, data) {
-  var c = document.getElementById(id);
-  if (!c || !data || !data.length) return;
-  var ctx = c.getContext('2d');
-  var W = c.clientWidth || c.width; c.width = W;
-  var H = c.height;
-  var p = {t:18,r:12,b:36,l:44};
-  var pw = W-p.l-p.r, ph = H-p.t-p.b, MQ = 42;
-  ctx.clearRect(0,0,W,H);
+/* ---------- Utilities ---------- */
+function downloadChart(id, name) {
+  var cv = document.getElementById(id); if (!cv) return;
+  var a = document.createElement('a');
+  a.download = (name || id) + '.png';
+  a.href = cv.toDataURL('image/png');
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+}
+
+function printReport() { window.print(); }
+
+/* ---------- Quality per position (mean + Q25/Q50/Q75 IQR overlay) ---------- */
+function drawQual(id, data, pct) {
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:16,b:36,l:44};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b, MQ = 42;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,W,H);
 
   /* quality zone backgrounds */
-  [[0,20,'rgba(248,81,73,.10)'],[20,28,'rgba(211,153,52,.10)'],[28,MQ,'rgba(63,185,80,.07)']].forEach(function(z){
-    var y1=p.t+(1-z[1]/MQ)*ph, y2=p.t+(1-z[0]/MQ)*ph;
-    ctx.fillStyle=z[2]; ctx.fillRect(p.l,y1,pw,y2-y1);
+  [[0,20,'rgba(220,53,69,.07)'],[20,28,'rgba(255,193,7,.08)'],[28,MQ,'rgba(25,135,84,.06)']].forEach(function(z){
+    var y1=pad.t+(1-z[1]/MQ)*ph, y2=pad.t+(1-z[0]/MQ)*ph;
+    ctx.fillStyle=z[2]; ctx.fillRect(pad.l,y1,pw,y2-y1);
   });
 
   /* dashed threshold lines */
-  [[20,'rgba(248,81,73,.45)'],[28,'rgba(211,153,52,.45)'],[30,'rgba(63,185,80,.35)']].forEach(function(qc){
-    var y=p.t+(1-qc[0]/MQ)*ph;
+  [[20,'rgba(220,53,69,.35)'],[28,'rgba(200,150,0,.45)'],[30,'rgba(25,135,84,.35)']].forEach(function(qc){
+    var y=pad.t+(1-qc[0]/MQ)*ph;
     ctx.setLineDash([3,4]); ctx.strokeStyle=qc[1]; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(W-p.r,y); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
   });
   ctx.setLineDash([]);
 
   /* grid lines */
   [0,10,20,30,40].forEach(function(q){
-    var y=p.t+(1-q/MQ)*ph;
-    ctx.strokeStyle='rgba(48,54,61,0.6)'; ctx.lineWidth=1;
-    ctx.beginPath(); ctx.moveTo(p.l,y); ctx.lineTo(W-p.r,y); ctx.stroke();
+    var y=pad.t+(1-q/MQ)*ph;
+    ctx.strokeStyle='rgba(0,0,0,.07)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
   });
 
-  /* filled area + line */
+  /* Q25–Q75 IQR band + Q50 median line */
+  if (pct && pct.length > 1) {
+    var np = pct.length;
+    ctx.beginPath();
+    pct.forEach(function(pp, ii) {
+      var x=pad.l+(ii/(np-1))*pw, y=pad.t+(1-Math.min(pp[0],MQ)/MQ)*ph;
+      if(ii===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    for (var ri=np-1; ri>=0; ri--) {
+      ctx.lineTo(pad.l+(ri/(np-1))*pw, pad.t+(1-Math.min(pct[ri][2],MQ)/MQ)*ph);
+    }
+    ctx.closePath();
+    ctx.fillStyle='rgba(26,95,168,.13)'; ctx.fill();
+
+    ctx.beginPath();
+    pct.forEach(function(pp, ii) {
+      var x=pad.l+(ii/(np-1))*pw, y=pad.t+(1-Math.min(pp[1],MQ)/MQ)*ph;
+      if(ii===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    });
+    ctx.strokeStyle='rgba(200,120,0,.7)'; ctx.lineWidth=1.5;
+    ctx.setLineDash([]); ctx.stroke();
+  }
+
+  /* filled area + mean line */
   if (data.length > 1) {
-    var grad = ctx.createLinearGradient(0,p.t,0,H-p.b);
-    grad.addColorStop(0,'rgba(88,166,255,.25)');
-    grad.addColorStop(1,'rgba(88,166,255,0)');
+    var grad = ctx.createLinearGradient(0,pad.t,0,H-pad.b);
+    grad.addColorStop(0,'rgba(26,95,168,.20)');
+    grad.addColorStop(1,'rgba(26,95,168,0)');
     ctx.beginPath();
     data.forEach(function(q,i){
-      var x=p.l+(i/(data.length-1))*pw, y=p.t+(1-Math.min(q,MQ)/MQ)*ph;
+      var x=pad.l+(i/(data.length-1))*pw, y=pad.t+(1-Math.min(q,MQ)/MQ)*ph;
       i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
     });
-    ctx.lineTo(p.l+pw,H-p.b); ctx.lineTo(p.l,H-p.b);
+    ctx.lineTo(pad.l+pw,H-pad.b); ctx.lineTo(pad.l,H-pad.b);
     ctx.closePath(); ctx.fillStyle=grad; ctx.fill();
 
     ctx.beginPath();
     data.forEach(function(q,i){
-      var x=p.l+(i/(data.length-1))*pw, y=p.t+(1-Math.min(q,MQ)/MQ)*ph;
+      var x=pad.l+(i/(data.length-1))*pw, y=pad.t+(1-Math.min(q,MQ)/MQ)*ph;
       i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
     });
-    ctx.strokeStyle='#58a6ff'; ctx.lineWidth=2; ctx.stroke();
+    ctx.strokeStyle='#1a5fa8'; ctx.lineWidth=2;
+    ctx.setLineDash([]); ctx.stroke();
   }
 
   /* axes */
-  ctx.strokeStyle='#30363d'; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,H-p.b); ctx.lineTo(W-p.r,H-p.b); ctx.stroke();
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
 
   /* Y labels */
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='right';
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='right';
   [0,10,20,28,30,40].forEach(function(q){
-    ctx.fillText(q,p.l-5,p.t+(1-q/MQ)*ph+4);
+    ctx.fillText(q, pad.l-5, pad.t+(1-q/MQ)*ph+4);
   });
 
   /* X labels */
@@ -326,27 +376,39 @@ function drawQual(id, data) {
   var n = data.length;
   var step = n > 300 ? 100 : n > 150 ? 50 : n > 50 ? 25 : 10;
   for (var i=0; i<n; i+=step) {
-    ctx.fillText(i+1, p.l+(i/Math.max(n-1,1))*pw, H-p.b+14);
+    ctx.fillText(i+1, pad.l+(i/Math.max(n-1,1))*pw, H-pad.b+14);
   }
-  ctx.fillText(n, p.l+pw, H-p.b+14);
+  ctx.fillText(n, pad.l+pw, H-pad.b+14);
 
   /* axis titles */
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='center';
-  ctx.fillText('Position (bp)', p.l+pw/2, H-2);
-  ctx.save(); ctx.translate(10,p.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='center';
+  ctx.fillText('Position (bp)', pad.l+pw/2, H-2);
+  ctx.save(); ctx.translate(10,pad.t+ph/2); ctx.rotate(-Math.PI/2);
   ctx.fillText('Phred Quality', 0, 0); ctx.restore();
+
+  /* legend (only when percentile data present) */
+  if (pct && pct.length) {
+    var lx = W-pad.r-126, ly = pad.t+4;
+    ctx.font='10px monospace'; ctx.textAlign='left';
+    ctx.fillStyle='#1a5fa8'; ctx.fillRect(lx,ly,14,3);
+    ctx.fillStyle='#5a6370'; ctx.fillText('Mean',lx+17,ly+5);
+    ctx.fillStyle='rgba(200,120,0,.7)'; ctx.fillRect(lx,ly+11,14,2);
+    ctx.fillStyle='#5a6370'; ctx.fillText('Median (Q50)',lx+17,ly+16);
+    ctx.fillStyle='rgba(26,95,168,.18)'; ctx.fillRect(lx,ly+22,14,8);
+    ctx.fillStyle='#5a6370'; ctx.fillText('IQR Q25–Q75',lx+17,ly+30);
+  }
 }
 
 /* ---------- Read length distribution ---------- */
 function drawLen(id, data) {
-  var c = document.getElementById(id);
-  if (!c || !data || !data.length) return;
-  var ctx = c.getContext('2d');
-  var W = c.clientWidth || c.width; c.width = W;
-  var H = c.height;
-  var p = {t:18,r:12,b:40,l:60};
-  var pw = W-p.l-p.r, ph = H-p.t-p.b;
-  ctx.clearRect(0,0,W,H);
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:12,b:40,l:60};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
 
   var maxC = 0;
   data.forEach(function(d){ if(d[1]>maxC) maxC=d[1]; });
@@ -354,97 +416,92 @@ function drawLen(id, data) {
   var bw = pw / n;
 
   data.forEach(function(d,i){
-    var x = p.l + i*bw;
+    var x = pad.l + i*bw;
     var bh = (d[1]/maxC)*ph;
-    var y = p.t+ph-bh;
+    var y = pad.t+ph-bh;
     var grad = ctx.createLinearGradient(0,y,0,y+bh);
-    grad.addColorStop(0,'rgba(88,166,255,.85)');
-    grad.addColorStop(1,'rgba(88,166,255,.45)');
+    grad.addColorStop(0,'rgba(26,95,168,.85)');
+    grad.addColorStop(1,'rgba(26,95,168,.40)');
     ctx.fillStyle = grad;
     ctx.fillRect(x+0.5, y, Math.max(1, bw-1), bh);
   });
 
   /* axes */
-  ctx.strokeStyle='#30363d'; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,H-p.b); ctx.lineTo(W-p.r,H-p.b); ctx.stroke();
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
 
   /* X labels */
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='center';
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='center';
   var lblN = Math.min(6, n);
   for (var i=0; i<lblN; i++) {
     var idx = Math.round(i*(n-1)/(Math.max(lblN-1,1)));
-    var x = p.l+(idx+0.5)*bw;
+    var x = pad.l+(idx+0.5)*bw;
     var len = data[idx][0];
-    ctx.fillText(len>999?(len/1000).toFixed(1)+'k':len+'bp', x, H-p.b+14);
+    ctx.fillText(len>999?(len/1000).toFixed(1)+'k':len+'bp', x, H-pad.b+14);
   }
 
   /* Y labels */
   ctx.textAlign='right';
-  [0,.5,1].forEach(function(f){
-    var v=Math.round(maxC*f);
-    var label = v>999999?(v/1000000).toFixed(1)+'M':v>999?(v/1000).toFixed(0)+'k':v;
-    ctx.fillText(label, p.l-5, p.t+(1-f)*ph+4);
+  [0,.5,1].forEach(function(frac){
+    var v=Math.round(maxC*frac);
+    var label = v>999999?(v/1000000).toFixed(1)+'M':v>999?(v/1000).toFixed(0)+'k':String(v);
+    ctx.fillText(label, pad.l-5, pad.t+(1-frac)*ph+4);
   });
 
   /* axis titles */
   ctx.textAlign='center';
-  ctx.fillText('Read Length', p.l+pw/2, H-2);
-  ctx.save(); ctx.translate(10,p.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('Read Length', pad.l+pw/2, H-2);
+  ctx.save(); ctx.translate(10,pad.t+ph/2); ctx.rotate(-Math.PI/2);
   ctx.fillText('Count', 0, 0); ctx.restore();
 }
 
 /* ---------- K-mer frequency ---------- */
 function drawKmer(id, data) {
-  var c = document.getElementById(id);
-  if (!c || !data || !data.length) return;
-  var H = Math.max(260, data.length*22+20); c.height = H;
-  var ctx = c.getContext('2d');
-  var W = c.clientWidth || c.width; c.width = W;
-  var p = {t:10,r:90,b:10,l:68};
-  var pw = W-p.l-p.r, ph = H-p.t-p.b;
-  ctx.clearRect(0,0,W,H);
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var H = Math.max(260, data.length*22+20); cv.height = H;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var pad = {t:10,r:90,b:10,l:68};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
 
   var maxC = data[0][1];
   var rowH = ph/data.length;
   var barH = Math.max(10, rowH-4);
-  var ntCol = {A:'#3fb950',C:'#58a6ff',G:'#d29922',T:'#f85149',N:'#8b949e'};
+  var ntCol = {A:'#1a7a3e',C:'#1a5fa8',G:'#7a5500',T:'#991b1b',N:'#5a6370'};
 
   data.forEach(function(d,i){
     var kmer=d[0], cnt=d[1];
-    var y = p.t + i*rowH + (rowH-barH)/2;
+    var y = pad.t + i*rowH + (rowH-barH)/2;
     var bw = (cnt/maxC)*pw;
 
-    /* bar */
-    ctx.fillStyle='rgba(88,166,255,0.65)';
-    ctx.fillRect(p.l, y, bw, barH);
+    ctx.fillStyle='rgba(26,95,168,0.55)';
+    ctx.fillRect(pad.l, y, bw, barH);
 
-    /* k-mer label (colored by nucleotide) */
-    ctx.font = 'bold 12px monospace';
-    ctx.textAlign = 'right';
+    ctx.font = 'bold 12px monospace'; ctx.textAlign = 'right';
     var cw = 8.4;
-    var startX = p.l - 5 - (kmer.length-1)*cw;
+    var startX = pad.l - 5 - (kmer.length-1)*cw;
     for (var j=0; j<kmer.length; j++) {
-      var nt = kmer[j];
-      ctx.fillStyle = ntCol[nt] || '#c9d1d9';
-      ctx.fillText(nt, startX + j*cw + cw, y+barH-3);
+      ctx.fillStyle = ntCol[kmer[j]] || '#1a1f2e';
+      ctx.fillText(kmer[j], startX + j*cw + cw, y+barH-3);
     }
 
-    /* count label */
-    ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='left';
-    ctx.fillText(cnt.toLocaleString(), p.l+bw+5, y+barH-3);
+    ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='left';
+    ctx.fillText(cnt.toLocaleString(), pad.l+bw+5, y+barH-3);
   });
 }
 
 /* ---------- Per-tile quality ---------- */
 function drawTile(id, data) {
-  var c = document.getElementById(id);
-  if (!c || !data || !data.length) return;
-  var ctx = c.getContext('2d');
-  var W = c.clientWidth || c.width; c.width = W;
-  var H = c.height;
-  var p = {t:18,r:12,b:36,l:60};
-  var pw = W-p.l-p.r, ph = H-p.t-p.b, MQ = 42;
-  ctx.clearRect(0,0,W,H);
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:12,b:36,l:60};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
 
   var n = data.length;
   var bw = pw / n;
@@ -454,105 +511,97 @@ function drawTile(id, data) {
 
   data.forEach(function(d,i){
     var q = d[1];
-    var x = p.l + i*bw;
+    var x = pad.l + i*bw;
     var bh = ((q - minQ) / rng) * ph;
-    var y = p.t + ph - bh;
-    /* colour: red→yellow→green */
+    var y = pad.t + ph - bh;
     var t = (q - minQ) / rng;
-    var r = Math.round(248*(1-t) + 63*t);
-    var g = Math.round(81*(1-t) + 185*t);
-    var b2 = Math.round(73*(1-t) + 80*t);
-    ctx.fillStyle = 'rgba('+r+','+g+','+b2+',0.8)';
+    var rc = Math.round(200*(1-t) + 25*t);
+    var gc = Math.round(50*(1-t) + 135*t);
+    var bc = Math.round(50*(1-t) + 84*t);
+    ctx.fillStyle = 'rgba('+rc+','+gc+','+bc+',0.85)';
     ctx.fillRect(x+0.5, y, Math.max(1,bw-1), bh);
   });
 
-  ctx.strokeStyle='#30363d'; ctx.lineWidth=1;
-  ctx.beginPath(); ctx.moveTo(p.l,p.t); ctx.lineTo(p.l,H-p.b); ctx.lineTo(W-p.r,H-p.b); ctx.stroke();
+  ctx.strokeStyle='#555'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
 
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace'; ctx.textAlign='right';
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='right';
   [minQ, (minQ+maxQ)/2, maxQ].forEach(function(q){
-    var y=p.t+(1-(q-minQ)/rng)*ph;
-    ctx.fillText(q.toFixed(1),p.l-5,y+4);
+    var y=pad.t+(1-(q-minQ)/rng)*ph;
+    ctx.fillText(q.toFixed(1), pad.l-5, y+4);
   });
 
   ctx.textAlign='center';
   var lblN = Math.min(8, n);
   for(var i=0; i<lblN; i++){
     var idx=Math.round(i*(n-1)/(Math.max(lblN-1,1)));
-    var x=p.l+(idx+0.5)*bw;
-    ctx.fillText(data[idx][0], x, H-p.b+14);
+    ctx.fillText(data[idx][0], pad.l+(idx+0.5)*bw, H-pad.b+14);
   }
-  ctx.fillText('Tile ID', p.l+pw/2, H-2);
+  ctx.fillText('Tile ID', pad.l+pw/2, H-2);
 }
 
 /* ---------- Base composition chart ---------- */
 function drawBaseComp(id, data) {
-  // data: array of [A%, C%, G%, T%, N%] per position
   var cv=document.getElementById(id); if(!cv)return;
   var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
-  var p={l:52,r:16,t:20,b:36};
-  var pw=W-p.l-p.r, ph=H-p.t-p.b;
-  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
-  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
-  var colors=['#58a6ff','#3fb950','#f78166','#d29922','#8b949e']; // A,C,G,T,N
+  var pad={l:52,r:16,t:20,b:36};
+  var pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#5a6370';ctx.font='14px monospace';ctx.textAlign='center';ctx.fillText('No data',W/2,H/2);return;}
+  var colors=['#1a5fa8','#1a7a3e','#dc3545','#7a5500','#5a6370']; // A,C,G,T,N
   var labels=['A','C','G','T','N'];
   var n=data.length, bw=pw/n;
-  // grid
-  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
-  for(var g=0;g<=4;g++){var y=p.t+ph*(1-g/4);ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
-  // draw lines
+  ctx.strokeStyle='rgba(0,0,0,.07)'; ctx.lineWidth=1;
+  for(var gi=0;gi<=4;gi++){var gy=pad.t+ph*(1-gi/4);ctx.beginPath();ctx.moveTo(pad.l,gy);ctx.lineTo(pad.l+pw,gy);ctx.stroke();}
   labels.forEach(function(lbl,li){
     ctx.strokeStyle=colors[li]; ctx.lineWidth=1.5; ctx.beginPath();
     data.forEach(function(pt,xi){
-      var x=p.l+(xi+0.5)*bw, y=p.t+ph*(1-pt[li]/100);
+      var x=pad.l+(xi+0.5)*bw, y=pad.t+ph*(1-pt[li]/100);
       if(xi===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
     });
     ctx.stroke();
   });
-  // axes
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
-  for(var g=0;g<=4;g++){ctx.fillText((g*25)+'%',2,p.t+ph*(1-g/4)+4);}
-  ctx.fillText('1',p.l,H-p.b+14);
-  ctx.fillText(n,p.l+pw-20,H-p.b+14);
-  // legend
-  var lx=p.l+4;
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='right';
+  for(var gi=0;gi<=4;gi++){ctx.fillText((gi*25)+'%', pad.l-4, pad.t+ph*(1-gi/4)+4);}
+  ctx.textAlign='center';
+  ctx.fillText('1',pad.l,H-pad.b+14);
+  ctx.fillText(n,pad.l+pw-20,H-pad.b+14);
+  ctx.fillText('Position (bp)',pad.l+pw/2,H-2);
+  var lx=pad.l+4;
   labels.forEach(function(lbl,li){
-    ctx.fillStyle=colors[li]; ctx.fillRect(lx,p.t+2,10,10);
-    ctx.fillStyle='#c9d1d9'; ctx.fillText(lbl,lx+13,p.t+11); lx+=32;
+    ctx.fillStyle=colors[li]; ctx.fillRect(lx,pad.t+2,10,10);
+    ctx.fillStyle='#1a1f2e'; ctx.textAlign='left'; ctx.fillText(lbl,lx+13,pad.t+11); lx+=32;
   });
 }
 
 /* ---------- Quality distribution chart ---------- */
 function drawQualDist(id, data) {
-  // data: array of 43 counts indexed by mean Phred score
   var cv=document.getElementById(id); if(!cv)return;
   var ctx=cv.getContext('2d'), W=cv.width, H=cv.height;
-  var p={l:52,r:16,t:20,b:36};
-  var pw=W-p.l-p.r, ph=H-p.t-p.b;
-  ctx.fillStyle='#0d1117'; ctx.fillRect(0,0,W,H);
-  if(!data||!data.length){ctx.fillStyle='#8b949e';ctx.font='14px monospace';ctx.fillText('No data',W/2-30,H/2);return;}
-  var max=Math.max.apply(null,data)||1;
+  var pad={l:52,r:16,t:20,b:36};
+  var pw=W-pad.l-pad.r, ph=H-pad.t-pad.b;
+  ctx.fillStyle='#ffffff'; ctx.fillRect(0,0,W,H);
+  if(!data||!data.length){ctx.fillStyle='#5a6370';ctx.font='14px monospace';ctx.textAlign='center';ctx.fillText('No data',W/2,H/2);return;}
+  var mx=Math.max.apply(null,data)||1;
   var n=data.length, bw=pw/n;
   data.forEach(function(cnt,q){
-    var pct=cnt/max;
-    var r=q<20?200:q<30?210:80, g=q<20?80:q<30?160:200, b=q<20?80:q<30?80:100;
-    ctx.fillStyle='rgba('+r+','+g+','+b+',0.85)';
-    var barH=ph*pct;
-    ctx.fillRect(p.l+q*bw, p.t+ph-barH, bw-1, barH);
+    var frac=cnt/mx;
+    var rc=q<20?180:q<30?180:40, gc=q<20?40:q<30?130:150, bc=q<20?40:q<30?40:60;
+    ctx.fillStyle='rgba('+rc+','+gc+','+bc+',0.80)';
+    var barH=ph*frac;
+    ctx.fillRect(pad.l+q*bw, pad.t+ph-barH, Math.max(1,bw-1), barH);
   });
-  // grid lines
-  ctx.strokeStyle='#21262d'; ctx.lineWidth=1;
-  for(var g=0;g<=4;g++){var y=p.t+ph*g/4;ctx.beginPath();ctx.moveTo(p.l,y);ctx.lineTo(p.l+pw,y);ctx.stroke();}
-  // labels
-  ctx.fillStyle='#8b949e'; ctx.font='11px monospace';
-  [0,10,20,30,40].forEach(function(q){ctx.fillText('Q'+q,p.l+q*bw-8,H-p.b+14);});
-  ctx.fillText('Mean Phred per read',p.l+pw/2-60,H-2);
+  ctx.strokeStyle='rgba(0,0,0,.07)'; ctx.lineWidth=1;
+  for(var gi=0;gi<=4;gi++){var gy=pad.t+ph*gi/4;ctx.beginPath();ctx.moveTo(pad.l,gy);ctx.lineTo(pad.l+pw,gy);ctx.stroke();}
+  ctx.fillStyle='#5a6370'; ctx.font='11px monospace'; ctx.textAlign='center';
+  [0,10,20,30,40].forEach(function(q){ctx.fillText('Q'+q, pad.l+q*bw-4, H-pad.b+14);});
+  ctx.fillText('Mean Phred score per read', pad.l+pw/2, H-2);
 }
 
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
-    drawQual('qual-'+i, f.qual);
+    drawQual('qual-'+i, f.qual, f.qual_pct);
     drawLen('len-'+i, f.len);
     drawKmer('kmer-'+i, f.kmers);
     drawBaseComp('basecomp-'+i, f.basecomp);
@@ -608,19 +657,18 @@ pub fn export_html(state: &SharedState, output_dir: &str, flags: &FeatureFlags) 
 
     // Header
     html.push_str("<div class=\"header\">\n");
-    html.push_str("<h1>BioFastq-A Quality Analysis Report</h1>\n");
+    html.push_str("<div class=\"header-left\">\n");
+    html.push_str("<h1>BioFastq-A <span>Quality Analysis Report</span></h1>\n");
     html.push_str("<div class=\"header-meta\">\n");
     html.push_str(&format!("<span>Generated: {}</span>\n", timestamp));
     html.push_str("<span>Tool version: 2.2.0</span>\n");
-    html.push_str(&format!(
-        "<span>Files analysed: {}</span>\n",
-        files.len()
-    ));
-    html.push_str(&format!(
-        "<span>Processing time: {:.1}s</span>\n",
-        elapsed
-    ));
+    html.push_str(&format!("<span>Files analysed: {}</span>\n", files.len()));
+    html.push_str(&format!("<span>Processing time: {:.1}s</span>\n", elapsed));
     html.push_str("</div>\n</div>\n");
+    html.push_str("<div class=\"header-actions no-print\">\n");
+    html.push_str("<button class=\"btn\" onclick=\"printReport()\">&#128438; Print / PDF</button>\n");
+    html.push_str("</div>\n");
+    html.push_str("</div>\n");
 
     // Summary table
     if files.len() > 1 {
@@ -751,16 +799,28 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
     s.push_str("<div class=\"charts-row\">\n");
 
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Per-Base Sequence Quality</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('qual-{idx}','per_base_quality')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
     s.push_str(&format!(
         "<canvas id=\"qual-{}\" width=\"600\" height=\"240\"></canvas>\n",
         idx
     ));
-    s.push_str("<p class=\"chart-note\">Green zone: Q&ge;28 &nbsp;|&nbsp; Orange: Q20&ndash;28 &nbsp;|&nbsp; Red: Q&lt;20</p>\n");
+    s.push_str("<p class=\"chart-note\">Blue line = mean quality. Orange dashed = median (Q50). Shaded band = IQR (Q25&ndash;Q75). Green zone: Q&ge;28 &nbsp;|&nbsp; Yellow: Q20&ndash;28 &nbsp;|&nbsp; Red: Q&lt;20.</p>\n");
     s.push_str("</div>\n");
 
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Read Length Distribution</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('len-{idx}','read_length_dist')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
     s.push_str(&format!(
         "<canvas id=\"len-{}\" width=\"600\" height=\"240\"></canvas>\n",
         idx
@@ -773,7 +833,15 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
     s.push_str("<div class=\"charts-row\">\n");
 
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Top K-mer Frequencies (4-mer)</h3>\n");
+    if flags.kmer_analysis {
+        s.push_str(&format!(
+            "<button class=\"dl-btn no-print\" onclick=\"downloadChart('kmer-{idx}','kmer_frequencies')\">&#8595; PNG</button>\n",
+            idx = idx
+        ));
+    }
+    s.push_str("</div>\n");
     if flags.kmer_analysis {
         s.push_str(&format!(
             "<canvas id=\"kmer-{}\" width=\"600\" height=\"300\"></canvas>\n",
@@ -830,7 +898,7 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
             dup_bar_color
         ));
         s.push_str("</div>\n</div>\n");
-        s.push_str("<p class=\"chart-note\">Estimated from fingerprint hashing of first 200,000 reads. &lt;5% = pass &nbsp;|&nbsp; 5–20% = warn &nbsp;|&nbsp; &gt;20% = high</p>\n");
+        s.push_str("<p class=\"chart-note\">HyperLogLog cardinality estimate across all reads (error &le;1%). &lt;5% = pass &nbsp;|&nbsp; 5&ndash;20% = warn &nbsp;|&nbsp; &gt;20% = high</p>\n");
     } else {
         s.push_str(&skipped_notice("--no-duplication / --fast"));
     }
@@ -838,7 +906,18 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
 
     // Per-tile quality card
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Per-Tile Quality Score</h3>\n");
+    if flags.per_tile_quality {
+        let tile_has_data = !f.sorted_tile_quality().is_empty();
+        if tile_has_data {
+            s.push_str(&format!(
+                "<button class=\"dl-btn no-print\" onclick=\"downloadChart('tile-{idx}','per_tile_quality')\">&#8595; PNG</button>\n",
+                idx = idx
+            ));
+        }
+    }
+    s.push_str("</div>\n");
     if !flags.per_tile_quality {
         s.push_str(&skipped_notice("--no-per-tile / --fast"));
     } else {
@@ -864,21 +943,33 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
     s.push_str("<div class=\"charts-row\">\n");
 
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Per-Base Sequence Content</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('basecomp-{idx}','base_composition')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
     s.push_str(&format!(
         "<canvas id=\"basecomp-{}\" width=\"600\" height=\"280\"></canvas>\n",
         idx
     ));
-    s.push_str("<p class=\"chart-note\">Base composition (A/C/G/T/N) per read position. Uniform lines indicate balanced sequence.</p>\n");
+    s.push_str("<p class=\"chart-note\">Nucleotide composition (A/C/G/T/N) per read position. Parallel flat lines = unbiased composition.</p>\n");
     s.push_str("</div>\n");
 
     s.push_str("<div class=\"chart-box\">\n");
+    s.push_str("<div class=\"chart-header\">\n");
     s.push_str("<h3>Per-Read Quality Distribution</h3>\n");
+    s.push_str(&format!(
+        "<button class=\"dl-btn no-print\" onclick=\"downloadChart('qualdist-{idx}','quality_distribution')\">&#8595; PNG</button>\n",
+        idx = idx
+    ));
+    s.push_str("</div>\n");
     s.push_str(&format!(
         "<canvas id=\"qualdist-{}\" width=\"600\" height=\"280\"></canvas>\n",
         idx
     ));
-    s.push_str("<p class=\"chart-note\">Distribution of mean Phred quality scores across all reads. Red=poor, orange=acceptable, green=good.</p>\n");
+    s.push_str("<p class=\"chart-note\">Histogram of mean Phred quality scores across all reads. Red = Q&lt;20, yellow = Q20&ndash;30, green = Q&ge;30.</p>\n");
     s.push_str("</div>\n");
 
     s.push_str("</div>\n"); // charts-row (row 4)
@@ -1009,8 +1100,16 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
     // Quality distribution: [count_at_Q0, count_at_Q1, ..., count_at_Q42]
     let qualdist_json: Vec<u64> = f.quality_distribution.clone();
 
+    // Q25/Q50/Q75 per position for IQR overlay on quality chart
+    let qual_pct_json: Vec<serde_json::Value> = f
+        .qual_percentiles_per_position()
+        .into_iter()
+        .map(|pct| serde_json::json!(pct))
+        .collect();
+
     serde_json::json!({
         "qual": qual_per_pos,
+        "qual_pct": qual_pct_json,
         "len": len_dist,
         "kmers": kmer_json,
         "tiles": tile_json,
