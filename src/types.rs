@@ -193,6 +193,12 @@ pub struct FileStats {
     pub base_composition: Vec<[u64; 5]>,
     // Quality score distribution: count of reads per mean Phred score (index = floor(phred))
     pub quality_distribution: Vec<u64>,
+    // Per-position Phred histogram for Q25/Q50/Q75 boxplot (FastQC-style)
+    pub qual_hist_by_position: Vec<[u64; 43]>,
+    // Average quality per length bin (bin = len/100bp): (phred_sum, count)
+    pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
+    // Trim counts broken down by adapter name
+    pub trimmed_by_adapter: HashMap<String, u64>,
     // Overrepresented sequences (sampled from first OVERREP_SAMPLE reads)
     pub overrepresented_sequences: Vec<OverrepSeq>,
     // Per-module QC pass/warn/fail status (FastQC-style traffic lights)
@@ -225,6 +231,9 @@ impl FileStats {
             per_tile_quality: HashMap::new(),
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
             quality_distribution: vec![0u64; PHRED_BUCKETS],
+            qual_hist_by_position: vec![[0u64; 43]; MAX_QUAL_POSITION],
+            quality_by_length_bin: HashMap::new(),
+            trimmed_by_adapter: HashMap::new(),
             overrepresented_sequences: Vec::new(),
             module_status: Vec::new(),
         }
@@ -396,6 +405,52 @@ impl FileStats {
             .iter()
             .map(|pct| pct[4])
             .collect()
+    }
+
+    #[allow(dead_code)]
+    /// Q25, Q50 (median), Q75 per base position — FastQC-style boxplot data.
+    /// Returns vec of [q25, q50, q75] in Phred units, trimmed to last covered position.
+    pub fn qual_percentiles_per_position(&self) -> Vec<[f64; 3]> {
+        let last = self.qual_hist_by_position
+            .iter()
+            .rposition(|h| h.iter().any(|&c| c > 0))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        self.qual_hist_by_position[..last]
+            .iter()
+            .map(|hist| {
+                let total: u64 = hist.iter().sum();
+                if total == 0 { return [0.0; 3]; }
+                let q25_thresh = total / 4;
+                let q50_thresh = total / 2;
+                let q75_thresh = total * 3 / 4;
+                let mut cumsum = 0u64;
+                let mut q25 = 0usize;
+                let mut q50 = 0usize;
+                let mut q75 = 0usize;
+                for (score, &count) in hist.iter().enumerate() {
+                    cumsum += count;
+                    if q25 == 0 && cumsum >= q25_thresh { q25 = score; }
+                    if q50 == 0 && cumsum >= q50_thresh { q50 = score; }
+                    if q75 == 0 && cumsum >= q75_thresh { q75 = score; }
+                    if q75 > 0 { break; }
+                }
+                [q25 as f64, q50 as f64, q75 as f64]
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    /// Average quality per length bin, sorted by bin index.
+    pub fn avg_quality_by_length(&self) -> Vec<(u32, f64)> {
+        let mut v: Vec<(u32, f64)> = self.quality_by_length_bin
+            .iter()
+            .map(|(&bin, &(sum, cnt))| {
+                (bin * 100, if cnt == 0 { 0.0 } else { sum as f64 / cnt as f64 })
+            })
+            .collect();
+        v.sort_by_key(|(bp, _)| *bp);
+        v
     }
 
     /// Top N k-mers by frequency.

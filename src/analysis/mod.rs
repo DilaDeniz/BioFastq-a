@@ -10,6 +10,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use hyperloglog::HyperLogLog;
 use needletail::parse_fastx_file;
 use needletail::Sequence;
 use rayon::prelude::*;
@@ -48,14 +49,14 @@ fn output_stem(path: &str) -> String {
     without_gz.to_string()
 }
 
-/// Apply quality trim + adapter clip to a record, returning effective slices.
+/// Apply quality trim + adapter clip to a record.
+/// Returns (trimmed_seq, trimmed_qual, Option<adapter_name>).
 #[inline]
 fn trim_record<'a>(
     seq: &'a [u8],
     qual: Option<&'a [u8]>,
     config: &ProcessConfig,
-) -> (&'a [u8], Option<&'a [u8]>, bool) {
-    // 3′ quality trim
+) -> (&'a [u8], Option<&'a [u8]>, Option<&'static str>) {
     let (seq, qual) = if config.quality_trim_threshold > 0 {
         if let Some(q) = qual {
             let cut = adapters::quality_trim_3p(q, config.quality_trim_threshold);
@@ -67,13 +68,12 @@ fn trim_record<'a>(
         (seq, qual)
     };
 
-    // Adapter detection (skip when --no-adapter is set)
     if !config.flags.adapter_detection {
-        return (seq, qual, false);
+        return (seq, qual, None);
     }
-    match adapters::find_adapter_pos_with_custom(seq, &config.custom_adapters) {
-        Some(pos) => (&seq[..pos], qual.map(|q| &q[..pos.min(q.len())]), true),
-        None => (seq, qual, false),
+    match adapters::find_adapter_with_name(seq, &config.custom_adapters) {
+        Some((pos, name)) => (&seq[..pos], qual.map(|q| &q[..pos.min(q.len())]), Some(name)),
+        None => (seq, qual, None),
     }
 }
 
@@ -93,15 +93,24 @@ fn detect_adapter_source(seq: &[u8]) -> String {
 }
 
 /// Finalize overrepresented sequence analysis from accumulated counts.
+/// Uses an adaptive threshold: max(0.1% of sampled, 99th-percentile of counts).
+/// This prevents noisy hits on small datasets and adapts to sequencing depth.
 fn finish_overrep(
     map: HashMap<[u8; 50], u64>,
     sampled: usize,
 ) -> Vec<OverrepSeq> {
     if sampled == 0 { return Vec::new(); }
-    let threshold = sampled as f64 * 0.001; // 0.1% of sampled reads
+    // Collect all counts and compute 99th percentile as adaptive floor
+    let mut all_counts: Vec<u64> = map.values().cloned().collect();
+    all_counts.sort_unstable();
+    let p99_idx = (all_counts.len() as f64 * 0.99) as usize;
+    let p99_threshold = all_counts.get(p99_idx).cloned().unwrap_or(1);
+    // Final threshold: at least 0.1% of reads AND at least the 99th percentile count
+    let pct_threshold = (sampled as f64 * 0.001).ceil() as u64;
+    let threshold = pct_threshold.max(p99_threshold).max(5);
     let mut sorted: Vec<([u8; 50], u64)> = map
         .into_iter()
-        .filter(|(_, c)| *c as f64 >= threshold)
+        .filter(|(_, c)| *c >= threshold)
         .collect();
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     sorted.truncate(20);
@@ -335,16 +344,17 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut bytes = 0u64;
     let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    // Deterministic dedup: exact count on first OVERREP_SAMPLE fingerprints
-    let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
-    let mut dup_sampled = 0usize;
-    // Overrepresented sequences: first 50bp of first OVERREP_SAMPLE reads
+    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    // HyperLogLog for global duplicate estimation across ALL reads (1% error, ~2KB memory)
+    let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
+    let mut trimmed_by_adapter: HashMap<String, u64> = HashMap::new();
     let mut flush_counter = 0u64;
     let mut total_flushed = 0u64;
     let mut error_occurred = false;
@@ -392,10 +402,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         let acc: BatchAccum = batch
             .par_iter()
             .fold(BatchAccum::default, move |mut acc, rec| {
-                let (effective_seq, effective_qual, adapter_hit) =
+                let (effective_seq, effective_qual, adapter_name) =
                     trim_record(&rec.seq, rec.qual.as_deref(), cfg);
-
-                // Per-tile (skip when --no-per-tile or --fast)
                 let tile_info = if per_tile_enabled {
                     parse_illumina_tile(&rec.id).and_then(|tile_id| {
                         effective_qual.map(|q| {
@@ -406,20 +414,16 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
                 } else {
                     None
                 };
-
                 let fp = fingerprint(effective_seq);
-                acc.process(effective_seq, effective_qual, tile_info, fp, adapter_hit);
+                acc.process(effective_seq, effective_qual, tile_info, fp, adapter_name.is_some());
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // --- Deterministic dedup (skip when --no-duplication or --fast) ---
+        // HyperLogLog: insert ALL fingerprints (no sampling cap)
         if config.flags.duplication_check {
             for &fp in &acc.fingerprints {
-                if dup_sampled < OVERREP_SAMPLE {
-                    *dup_map.entry(fp).or_insert(0) += 1;
-                    dup_sampled += 1;
-                }
+                hll.insert(&fp);
             }
         }
 
@@ -447,14 +451,15 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         // --- Trim output (sequential to preserve order) ---
         if config.trim_output {
             for rec in &batch {
-                let (trimmed_seq, trimmed_qual, adapter_hit) =
+                let (trimmed_seq, trimmed_qual, adapter_name) =
                     trim_record(&rec.seq, rec.qual.as_deref(), config);
-                if adapter_hit {
+                if let Some(name) = adapter_name {
                     trimmed_bases_removed += rec.seq.len() as u64 - trimmed_seq.len() as u64;
+                    *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
                 }
                 let keep = trimmed_seq.len() as u64 >= config.min_length;
                 if keep {
-                    if adapter_hit { trimmed_reads += 1; }
+                    if adapter_name.is_some() { trimmed_reads += 1; }
                     if let Some(ref mut w) = trim_writer {
                         if let Err(e) = write_fastq_record(w, &rec.id, trimmed_seq, trimmed_qual) {
                             state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
@@ -464,17 +469,16 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             }
         }
 
-        // --- Merge batch accumulator into running totals ---
         merge_batch_into_totals(
             &acc,
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos,
+            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
+            &mut quality_by_length_bin,
         );
 
-        // --- Periodic UI flush ---
         flush_counter += acc.read_count;
         if flush_counter >= FLUSH_INTERVAL {
             flush_counter = 0;
@@ -511,9 +515,11 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
     drop(trim_writer);
 
-    // Deterministic dup rate: count reads whose fingerprint appeared >1 time in sample
-    let dup_count: u64 = dup_map.values().map(|&c| if c > 1 { (c - 1) as u64 } else { 0 }).sum();
-    let dup_rate = if dup_sampled > 0 { dup_count as f64 / dup_sampled as f64 * 100.0 } else { 0.0 };
+    // HyperLogLog dup rate: (total - estimated_unique) / total
+    let dup_rate = if config.flags.duplication_check && read_count > 0 {
+        let unique_est = hll.len() as u64;
+        read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
+    } else { 0.0 };
 
     let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
 
@@ -534,11 +540,14 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.bytes_processed       = file_size;
         cur.length_histogram      = length_histogram;
         cur.quality_by_position   = quality_by_pos;
+        cur.qual_hist_by_position = qual_hist_by_pos;
         cur.kmer_counts           = kmer_total;
         cur.dup_rate_pct          = dup_rate;
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
+        cur.quality_by_length_bin = quality_by_length_bin;
+        cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
         cur.module_status = compute_module_status(cur);
     }
@@ -617,14 +626,16 @@ fn process_single_file_mmap(
     let mut bytes             = 0u64;
     let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
     let mut quality_by_pos    = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut qual_hist_by_pos  = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut base_composition  = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
+    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
-    let mut dup_map: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
-    let mut dup_sampled = 0usize;
+    let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
+    let mut trimmed_by_adapter: HashMap<String, u64> = HashMap::new();
     let mut flush_counter     = 0u64;
     let mut total_flushed     = 0u64;
 
@@ -674,7 +685,7 @@ fn process_single_file_mmap(
                 let id   = range.id(mmap_bytes);
                 let seq  = range.seq(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
-                let (eff_seq, eff_qual, adapter_hit) =
+                let (eff_seq, eff_qual, adapter_name) =
                     trim_record(seq, Some(qual), config);
                 let tile_info = if per_tile_enabled {
                     parse_illumina_tile(id).and_then(|tile_id| {
@@ -687,17 +698,14 @@ fn process_single_file_mmap(
                     None
                 };
                 let fp = fingerprint(eff_seq);
-                acc.process(eff_seq, eff_qual, tile_info, fp, adapter_hit);
+                acc.process(eff_seq, eff_qual, tile_info, fp, adapter_name.is_some());
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
         if config.flags.duplication_check {
             for &fp in &acc.fingerprints {
-                if dup_sampled < OVERREP_SAMPLE {
-                    *dup_map.entry(fp).or_insert(0) += 1;
-                    dup_sampled += 1;
-                }
+                hll.insert(&fp);
             }
         }
         if !acc.kmer_seqs.is_empty() {
@@ -723,13 +731,14 @@ fn process_single_file_mmap(
                 let seq  = range.seq(mmap_bytes);
                 let id   = range.id(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
-                let (trimmed_seq, trimmed_qual, adapter_hit) =
+                let (trimmed_seq, trimmed_qual, adapter_name) =
                     trim_record(seq, Some(qual), config);
-                if adapter_hit {
+                if let Some(name) = adapter_name {
                     trimmed_bases_removed += seq.len() as u64 - trimmed_seq.len() as u64;
+                    *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
                 }
                 if trimmed_seq.len() as u64 >= config.min_length {
-                    if adapter_hit { trimmed_reads += 1; }
+                    if adapter_name.is_some() { trimmed_reads += 1; }
                     if let Some(ref mut w) = trim_writer {
                         if let Err(e) = io::write_fastq_record(w, id, trimmed_seq, trimmed_qual) {
                             state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
@@ -744,8 +753,9 @@ fn process_single_file_mmap(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos,
+            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
+            &mut quality_by_length_bin,
         );
 
         flush_counter += acc.read_count;
@@ -781,8 +791,10 @@ fn process_single_file_mmap(
     producer.join().expect("reader thread panicked");
     drop(trim_writer);
 
-    let dup_count: u64 = dup_map.values().map(|&c| if c > 1 { (c - 1) as u64 } else { 0 }).sum();
-    let dup_rate = if dup_sampled > 0 { dup_count as f64 / dup_sampled as f64 * 100.0 } else { 0.0 };
+    let dup_rate = if config.flags.duplication_check && read_count > 0 {
+        let unique_est = hll.len() as u64;
+        read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
+    } else { 0.0 };
 
     let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
 
@@ -803,11 +815,14 @@ fn process_single_file_mmap(
         cur.bytes_processed       = file_size;
         cur.length_histogram      = length_histogram;
         cur.quality_by_position   = quality_by_pos;
+        cur.qual_hist_by_position = qual_hist_by_pos;
         cur.kmer_counts           = kmer_total;
         cur.dup_rate_pct          = dup_rate;
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
+        cur.quality_by_length_bin = quality_by_length_bin;
+        cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
         cur.module_status = compute_module_status(cur);
     }
@@ -897,12 +912,13 @@ fn process_paired_files(
     let mut bytes = 0u64;
     let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
+    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
-    let mut dup_map_pe: HashMap<u64, u32> = HashMap::with_capacity(OVERREP_SAMPLE);
-    let mut dup_sampled_pe = 0usize;
+    let mut hll_pe: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map_pe: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled_pe = 0usize;
     let mut flush_counter = 0u64;
@@ -949,13 +965,12 @@ fn process_paired_files(
         if batch.is_empty() { break; }
         bytes += batch_bytes;
 
-        // Process R1+R2 together in parallel — each pair is one unit
         let per_tile_enabled = config.flags.per_tile_quality;
         let acc: BatchAccum = batch
             .par_iter()
             .fold(BatchAccum::default, move |mut acc, (r1, r2)| {
                 for rec in [r1, r2] {
-                    let (eff_seq, eff_qual, adapter_hit) =
+                    let (eff_seq, eff_qual, adapter_name) =
                         trim_record(&rec.seq, rec.qual.as_deref(), config);
                     let tile_info = if per_tile_enabled {
                         parse_illumina_tile(&rec.id).and_then(|tile_id| {
@@ -968,19 +983,15 @@ fn process_paired_files(
                         None
                     };
                     let fp = fingerprint(eff_seq);
-                    acc.process(eff_seq, eff_qual, tile_info, fp, adapter_hit);
+                    acc.process(eff_seq, eff_qual, tile_info, fp, adapter_name.is_some());
                 }
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
 
-        // Dedup + overrep
         if config.flags.duplication_check {
             for &fp in &acc.fingerprints {
-                if dup_sampled_pe < OVERREP_SAMPLE {
-                    *dup_map_pe.entry(fp).or_insert(0) += 1;
-                    dup_sampled_pe += 1;
-                }
+                hll_pe.insert(&fp);
             }
         }
         if !acc.kmer_seqs.is_empty() {
@@ -1006,8 +1017,9 @@ fn process_paired_files(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos,
+            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
+            &mut quality_by_length_bin,
         );
 
         flush_counter += acc.read_count;
@@ -1036,30 +1048,34 @@ fn process_paired_files(
         }
     }
 
-    let dup_pe_count: u64 = dup_map_pe.values().map(|&c| if c > 1 { (c-1) as u64 } else { 0 }).sum();
-    let dup_rate = if dup_sampled_pe > 0 { dup_pe_count as f64 / dup_sampled_pe as f64 * 100.0 } else { 0.0 };
+    let dup_rate_pe = if config.flags.duplication_check && read_count > 0 {
+        let unique_est = hll_pe.len() as u64;
+        read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
+    } else { 0.0 };
     let overrep_seqs_pe = finish_overrep(overrep_map_pe, overrep_sampled_pe);
 
     let mut s = state.lock().unwrap();
     if let Some(ref mut cur) = s.current {
-        cur.read_count = read_count;
-        cur.total_bases = total_bases;
-        cur.gc_count = gc_count;
-        cur.quality_sum = quality_sum;
-        cur.quality_bases = quality_bases;
-        cur.q20_bases = q20_bases;
-        cur.q30_bases = q30_bases;
-        cur.adapter_hits = adapter_hits;
-        cur.min_length = min_length;
-        cur.max_length = max_length;
-        cur.bytes_processed = r1_size + r2_size;
-        cur.length_histogram = length_histogram;
-        cur.quality_by_position = quality_by_pos;
-        cur.kmer_counts = kmer_total;
-        cur.dup_rate_pct = dup_rate;
-        cur.per_tile_quality = per_tile;
-        cur.base_composition = base_composition;
-        cur.quality_distribution = quality_distribution;
+        cur.read_count            = read_count;
+        cur.total_bases           = total_bases;
+        cur.gc_count              = gc_count;
+        cur.quality_sum           = quality_sum;
+        cur.quality_bases         = quality_bases;
+        cur.q20_bases             = q20_bases;
+        cur.q30_bases             = q30_bases;
+        cur.adapter_hits          = adapter_hits;
+        cur.min_length            = min_length;
+        cur.max_length            = max_length;
+        cur.bytes_processed       = r1_size + r2_size;
+        cur.length_histogram      = length_histogram;
+        cur.quality_by_position   = quality_by_pos;
+        cur.qual_hist_by_position = qual_hist_by_pos;
+        cur.kmer_counts           = kmer_total;
+        cur.dup_rate_pct          = dup_rate_pe;
+        cur.per_tile_quality      = per_tile;
+        cur.base_composition      = base_composition;
+        cur.quality_distribution  = quality_distribution;
+        cur.quality_by_length_bin = quality_by_length_bin;
         cur.overrepresented_sequences = overrep_seqs_pe;
         cur.module_status = compute_module_status(cur);
     }
@@ -1072,7 +1088,7 @@ fn process_paired_files(
 
     s.log(LogLevel::Success, format!(
         "Done: {} pairs | GC {:.1}% | Q{:.1} | dup {:.1}% | {:.1} MB/s",
-        format_number(pairs), gc_pct, avg_q, dup_rate, mbps,
+        format_number(pairs), gc_pct, avg_q, dup_rate_pe, mbps,
     ));
 
     if let Some(done) = s.current.take() {

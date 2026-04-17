@@ -16,22 +16,20 @@ fn builtin_ac() -> &'static AhoCorasick {
     })
 }
 
-/// Find the leftmost position where any known or custom adapter begins.
-pub fn find_adapter_pos_with_custom(seq: &[u8], custom: &[Vec<u8>]) -> Option<usize> {
-    // Built-in adapters via Aho-Corasick (single pass over seq)
+/// Find the leftmost adapter hit and return (position, adapter_name).
+pub fn find_adapter_with_name(seq: &[u8], custom: &[Vec<u8>]) -> Option<(usize, &'static str)> {
     let builtin_hit = builtin_ac()
         .find(seq)
-        .map(|m| m.start());
+        .map(|m| (m.start(), ADAPTERS[m.pattern().as_usize()].0));
 
-    // Custom adapters (rare, simple scan)
-    let custom_hit = custom.iter().filter_map(|adapter| {
+    let custom_hit: Option<(usize, &'static str)> = custom.iter().filter_map(|adapter| {
         let n = adapter.len().min(ADAPTER_MATCH_LEN);
         if n == 0 { return None; }
-        seq.windows(n).position(|w| w == &adapter[..n])
-    }).min();
+        seq.windows(n).position(|w| w == &adapter[..n]).map(|p| (p, "custom"))
+    }).min_by_key(|&(p, _)| p);
 
     match (builtin_hit, custom_hit) {
-        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), Some(b)) => if a.0 <= b.0 { Some(a) } else { Some(b) },
         (a, b) => a.or(b),
     }
 }
