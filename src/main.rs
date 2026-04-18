@@ -59,6 +59,23 @@ OUTPUT OPTIONS:
   --multiqc           Write a MultiQC-compatible <stem>_mqc.json file
                       (drop it next to multiqc_data/ and run multiqc .)
 
+TRIMMING OPTIONS:
+  --poly-g [N]        Trim poly-G tails >= N bp (default N=10). Essential for
+                      NextSeq/NovaSeq 2-color chemistry data
+  --poly-x [N]        Trim any homopolymer tail >= N bp (default N=10)
+  --cut-right         Sliding window 5'->3': cut from first window with mean
+                      quality < threshold to read end (like Trimmomatic SLIDINGWINDOW)
+  --cut-front         Sliding window: trim low-quality bases from 5' end
+  --cut-tail          Sliding window: trim low-quality bases from 3' end
+  --window-size N     Window size for sliding window trims (default: 4)
+  --window-quality N  Phred quality threshold for sliding window trims (default: 20)
+  --trim-front N      Hard-trim N bases from every read's 5' end
+  --trim-tail N       Hard-trim N bases from every read's 3' end
+
+FILTERING OPTIONS:
+  --min-quality Q     Discard reads with mean Phred quality < Q (post-trim)
+  --max-n N           Discard reads with more than N uncalled (N) bases
+
 OUTPUT FILES:
   <stem>_report.html      Self-contained HTML report with interactive charts
   <stem>_report.json      Machine-readable JSON report
@@ -96,6 +113,20 @@ struct CliConfig {
     no_json: bool,
     fast: bool,
     multiqc: bool,
+    // New trimming/filtering options
+    poly_g: bool,
+    poly_g_min: u8,
+    poly_x: bool,
+    poly_x_min: u8,
+    cut_right: bool,
+    cut_front: bool,
+    cut_tail: bool,
+    window_size: u8,
+    window_qual: u8,
+    trim_front: u16,
+    trim_tail: u16,
+    min_quality: u8,
+    max_n: Option<u32>,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -130,6 +161,19 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut no_json = false;
     let mut fast = false;
     let mut multiqc = false;
+    let mut poly_g = false;
+    let mut poly_g_min: u8 = 0;
+    let mut poly_x = false;
+    let mut poly_x_min: u8 = 0;
+    let mut cut_right = false;
+    let mut cut_front = false;
+    let mut cut_tail = false;
+    let mut window_size: u8 = 4;
+    let mut window_qual: u8 = 20;
+    let mut trim_front: u16 = 0;
+    let mut trim_tail: u16 = 0;
+    let mut min_quality: u8 = 0;
+    let mut max_n: Option<u32> = None;
     let mut i = 0;
 
     while i < args.len() {
@@ -169,6 +213,63 @@ fn parse_args() -> Result<CliConfig, String> {
                     .map_err(|_| format!("--quality-trim must be 0-42, got '{}'", args[i]))?;
             }
             "--strict" => strict = true,
+            "--poly-g" => {
+                poly_g = true;
+                if i + 1 < args.len() {
+                    if let Ok(n) = args[i + 1].parse::<u8>() {
+                        poly_g_min = n; i += 1;
+                    }
+                }
+                if poly_g_min == 0 { poly_g_min = 10; }
+            }
+            "--poly-x" => {
+                poly_x = true;
+                if i + 1 < args.len() {
+                    if let Ok(n) = args[i + 1].parse::<u8>() {
+                        poly_x_min = n; i += 1;
+                    }
+                }
+                if poly_x_min == 0 { poly_x_min = 10; }
+            }
+            "--cut-right" => cut_right = true,
+            "--cut-front" => cut_front = true,
+            "--cut-tail"  => cut_tail = true,
+            "--window-size" => {
+                i += 1;
+                if i >= args.len() { return Err("--window-size requires a value".into()); }
+                window_size = args[i].parse::<u8>()
+                    .map_err(|_| format!("--window-size must be 1-50, got '{}'", args[i]))?;
+            }
+            "--window-quality" => {
+                i += 1;
+                if i >= args.len() { return Err("--window-quality requires a value".into()); }
+                window_qual = args[i].parse::<u8>()
+                    .map_err(|_| format!("--window-quality must be 0-42, got '{}'", args[i]))?;
+            }
+            "--trim-front" => {
+                i += 1;
+                if i >= args.len() { return Err("--trim-front requires a value".into()); }
+                trim_front = args[i].parse::<u16>()
+                    .map_err(|_| format!("--trim-front must be an integer, got '{}'", args[i]))?;
+            }
+            "--trim-tail" => {
+                i += 1;
+                if i >= args.len() { return Err("--trim-tail requires a value".into()); }
+                trim_tail = args[i].parse::<u16>()
+                    .map_err(|_| format!("--trim-tail must be an integer, got '{}'", args[i]))?;
+            }
+            "--min-quality" => {
+                i += 1;
+                if i >= args.len() { return Err("--min-quality requires a value".into()); }
+                min_quality = args[i].parse::<u8>()
+                    .map_err(|_| format!("--min-quality must be 0-42, got '{}'", args[i]))?;
+            }
+            "--max-n" => {
+                i += 1;
+                if i >= args.len() { return Err("--max-n requires a value".into()); }
+                max_n = Some(args[i].parse::<u32>()
+                    .map_err(|_| format!("--max-n must be a non-negative integer, got '{}'", args[i]))?);
+            }
             "--no-kmer" => no_kmer = true,
             "--no-duplication" => no_duplication = true,
             "--no-per-tile" => no_per_tile = true,
@@ -230,6 +331,19 @@ fn parse_args() -> Result<CliConfig, String> {
         no_json,
         fast,
         multiqc,
+        poly_g,
+        poly_g_min,
+        poly_x,
+        poly_x_min,
+        cut_right,
+        cut_front,
+        cut_tail,
+        window_size,
+        window_qual,
+        trim_front,
+        trim_tail,
+        min_quality,
+        max_n,
     })
 }
 
@@ -343,7 +457,7 @@ fn main() {
         json_report:       !cfg.no_json,
     };
 
-    let process_config = ProcessConfig {
+    let mut process_config = ProcessConfig {
         trim_output: cfg.trim,
         min_length: cfg.min_length,
         output_dir: cfg.output_dir.clone(),
@@ -352,7 +466,20 @@ fn main() {
         strict: cfg.strict,
         paired_end_r2: cfg.paired_r2.clone(),
         flags,
+        ..ProcessConfig::default()
     };
+    process_config.poly_g_min_len = if cfg.poly_g { cfg.poly_g_min } else { 0 };
+    process_config.poly_x_min_len = if cfg.poly_x { cfg.poly_x_min } else { 0 };
+    process_config.cut_right_window = if cfg.cut_right { cfg.window_size } else { 0 };
+    process_config.cut_right_qual   = cfg.window_qual;
+    process_config.cut_front_window = if cfg.cut_front { cfg.window_size } else { 0 };
+    process_config.cut_front_qual   = cfg.window_qual;
+    process_config.cut_tail_window  = if cfg.cut_tail { cfg.window_size } else { 0 };
+    process_config.cut_tail_qual    = cfg.window_qual;
+    process_config.trim_front_bases = cfg.trim_front;
+    process_config.trim_tail_bases  = cfg.trim_tail;
+    process_config.min_avg_quality  = cfg.min_quality;
+    process_config.max_n_bases      = cfg.max_n;
 
     let n_files = cfg.input_files.len();
     let state = Arc::new(Mutex::new(SharedState::new(n_files)));

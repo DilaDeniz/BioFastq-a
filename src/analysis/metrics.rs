@@ -38,6 +38,8 @@ pub struct BatchAccum {
     pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
     /// Per-read GC content histogram: index = GC% (0..=100).
     pub gc_per_read: [u64; 101],
+    /// Reads discarded by per-read quality/N filters — incremented by caller in mod.rs.
+    pub reads_filtered: u64,
 }
 
 impl Default for BatchAccum {
@@ -63,6 +65,7 @@ impl Default for BatchAccum {
             fingerprints: Vec::new(),
             quality_by_length_bin: HashMap::new(),
             gc_per_read: [0u64; 101],
+            reads_filtered: 0,
         }
     }
 }
@@ -191,6 +194,7 @@ impl BatchAccum {
         for (dst, &src) in self.gc_per_read.iter_mut().zip(other.gc_per_read.iter()) {
             *dst += src;
         }
+        self.reads_filtered += other.reads_filtered;
         self.kmer_seqs.extend(other.kmer_seqs);
         self.fingerprints.extend(other.fingerprints);
         self

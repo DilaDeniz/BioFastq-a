@@ -130,6 +130,30 @@ pub struct ProcessConfig {
     pub custom_adapters: Vec<Vec<u8>>,
     /// If > 0, quality-trim the 3' end: drop trailing bases with Phred < threshold
     pub quality_trim_threshold: u8,
+    /// Trim poly-G tails >= this many bp (0 = disabled). Auto-detect NovaSeq/NextSeq: not implemented yet, set manually.
+    pub poly_g_min_len: u8,
+    /// Trim poly-X tails >= this many bp (0 = disabled).
+    pub poly_x_min_len: u8,
+    /// Sliding window cut-right: window size (0 = disabled). Cuts from first bad window to read end.
+    pub cut_right_window: u8,
+    /// Sliding window cut-right: Phred quality threshold (default 20).
+    pub cut_right_qual: u8,
+    /// Sliding window cut-front: window size (0 = disabled). Trims bad quality from 5' end.
+    pub cut_front_window: u8,
+    /// Sliding window cut-front: Phred quality threshold (default 20).
+    pub cut_front_qual: u8,
+    /// Sliding window cut-tail: window size (0 = disabled). Trims bad quality from 3' end.
+    pub cut_tail_window: u8,
+    /// Sliding window cut-tail: Phred quality threshold (default 20).
+    pub cut_tail_qual: u8,
+    /// Hard-trim this many bases from the 5' end of every read (0 = disabled).
+    pub trim_front_bases: u16,
+    /// Hard-trim this many bases from the 3' end of every read (0 = disabled).
+    pub trim_tail_bases: u16,
+    /// Discard reads whose mean Phred quality (post-trim) is below this value (0 = disabled).
+    pub min_avg_quality: u8,
+    /// Discard reads with more than this many N bases (post-trim). None = disabled.
+    pub max_n_bases: Option<u32>,
     /// Abort on first malformed record instead of skipping it
     pub strict: bool,
     /// If set, treat input as paired-end: this is the R2 file path.
@@ -147,6 +171,18 @@ impl Default for ProcessConfig {
             output_dir: ".".to_string(),
             custom_adapters: Vec::new(),
             quality_trim_threshold: 0,
+            poly_g_min_len: 0,
+            poly_x_min_len: 0,
+            cut_right_window: 0,
+            cut_right_qual: 20,
+            cut_front_window: 0,
+            cut_front_qual: 20,
+            cut_tail_window: 0,
+            cut_tail_qual: 20,
+            trim_front_bases: 0,
+            trim_tail_bases: 0,
+            min_avg_quality: 0,
+            max_n_bases: None,
             strict: false,
             paired_end_r2: None,
             flags: FeatureFlags::default(),
@@ -185,6 +221,8 @@ pub struct FileStats {
     pub trimmed_reads: u64,
     pub trimmed_bases_removed: u64,
     pub trim_output_path: Option<String>,
+    /// Reads discarded by per-read quality/N filters (post-trim)
+    pub reads_filtered: u64,
     // Duplication estimate via HyperLogLog (all reads)
     pub dup_rate_pct: f64,
     // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
@@ -231,6 +269,7 @@ impl FileStats {
             trimmed_reads: 0,
             trimmed_bases_removed: 0,
             trim_output_path: None,
+            reads_filtered: 0,
             dup_rate_pct: 0.0,
             per_tile_quality: HashMap::new(),
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],

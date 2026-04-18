@@ -926,6 +926,17 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
         &format!("{:.2}%", f.adapter_pct()),
         adapter_class,
     );
+    if f.reads_filtered > 0 {
+        stat_card(
+            &mut s,
+            "Filtered Reads",
+            &format!("{} ({:.1}%)",
+                format_number(f.reads_filtered),
+                f.reads_filtered as f64 / (f.read_count + f.reads_filtered) as f64 * 100.0
+            ),
+            "warn",
+        );
+    }
     s.push_str("</div>\n"); // stats-grid
 
     // Charts row 1: quality per position + length distribution

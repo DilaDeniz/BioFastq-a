@@ -49,32 +49,117 @@ fn output_stem(path: &str) -> String {
     without_gz.to_string()
 }
 
-/// Apply quality trim + adapter clip to a record.
-/// Returns (trimmed_seq, trimmed_qual, Option<adapter_name>).
+/// Apply all trimming steps in biologically correct order.
+/// Returns None if the read is filtered out (fails quality/N/length checks).
+/// Returns Some((trimmed_seq, trimmed_qual, adapter_name)) if the read passes.
+#[allow(clippy::type_complexity)]
 #[inline]
 fn trim_record<'a>(
     seq: &'a [u8],
     qual: Option<&'a [u8]>,
     config: &ProcessConfig,
-) -> (&'a [u8], Option<&'a [u8]>, Option<&'static str>) {
-    let (seq, qual) = if config.quality_trim_threshold > 0 {
+) -> Option<(&'a [u8], Option<&'a [u8]>, Option<&'static str>)> {
+    let mut seq = seq;
+    let mut qual = qual;
+
+    // 1. Hard global trim (front, then tail)
+    let front = config.trim_front_bases as usize;
+    let tail  = config.trim_tail_bases as usize;
+    if front > 0 && seq.len() > front {
+        seq  = &seq[front..];
+        qual = qual.map(|q| &q[front.min(q.len())..]);
+    } else if front >= seq.len() && front > 0 {
+        return None; // trimmed to nothing
+    }
+    if tail > 0 && seq.len() > tail {
+        let cut = seq.len() - tail;
+        seq  = &seq[..cut];
+        qual = qual.map(|q| &q[..cut.min(q.len())]);
+    } else if tail >= seq.len() && tail > 0 {
+        return None;
+    }
+
+    // 2. Sliding window quality trimming
+    if let Some(q) = qual {
+        // cut_front: advance start past low-quality 5' bases
+        if config.cut_front_window > 0 {
+            let start = adapters::sliding_window_cut_front(
+                q, config.cut_front_window as usize, config.cut_front_qual);
+            if start >= seq.len() { return None; }
+            seq  = &seq[start..];
+            qual = Some(&q[start..]);
+        }
+        // cut_right: cut from first bad window to read end
+        if config.cut_right_window > 0 {
+            let q2 = qual.unwrap_or(q);
+            let cut = adapters::sliding_window_cut_right(
+                q2, config.cut_right_window as usize, config.cut_right_qual);
+            if cut == 0 { return None; }
+            seq  = &seq[..cut.min(seq.len())];
+            qual = Some(&q2[..cut]);
+        }
+        // cut_tail: shrink end past low-quality 3' bases
+        if config.cut_tail_window > 0 {
+            let q3 = qual.unwrap_or(q);
+            let cut = adapters::sliding_window_cut_tail(
+                q3, config.cut_tail_window as usize, config.cut_tail_qual);
+            if cut == 0 { return None; }
+            seq  = &seq[..cut.min(seq.len())];
+            qual = Some(&q3[..cut]);
+        }
+    }
+
+    // 3. PolyG trimming (3' end — 2-color Illumina artifact)
+    if config.poly_g_min_len > 0 {
+        let cut = adapters::trim_poly_base(seq, b'G', config.poly_g_min_len as usize);
+        seq  = &seq[..cut];
+        qual = qual.map(|q| &q[..cut.min(q.len())]);
+    }
+
+    // 4. Existing per-base 3' quality trim
+    if config.quality_trim_threshold > 0 {
         if let Some(q) = qual {
             let cut = adapters::quality_trim_3p(q, config.quality_trim_threshold);
-            (&seq[..cut], Some(&q[..cut]))
-        } else {
-            (seq, qual)
+            seq  = &seq[..cut.min(seq.len())];
+            qual = Some(&q[..cut]);
+        }
+    }
+
+    // 5. Adapter detection & trim
+    let adapter_name = if config.flags.adapter_detection {
+        match adapters::find_adapter_with_name(seq, &config.custom_adapters) {
+            Some((pos, name)) => {
+                seq  = &seq[..pos];
+                qual = qual.map(|q| &q[..pos.min(q.len())]);
+                Some(name)
+            }
+            None => None,
         }
     } else {
-        (seq, qual)
+        None
     };
 
-    if !config.flags.adapter_detection {
-        return (seq, qual, None);
+    // 6. PolyX trimming (any homopolymer at 3' end)
+    if config.poly_x_min_len > 0 && !seq.is_empty() {
+        // Detect dominant 3' base and trim if it forms a run
+        let dominant_base = *seq.last().unwrap();
+        // Only trim if it's not already handled by polyG
+        if dominant_base != b'G' || config.poly_g_min_len == 0 {
+            let cut = adapters::trim_poly_base(seq, dominant_base, config.poly_x_min_len as usize);
+            seq  = &seq[..cut];
+            qual = qual.map(|q| &q[..cut.min(q.len())]);
+        }
     }
-    match adapters::find_adapter_with_name(seq, &config.custom_adapters) {
-        Some((pos, name)) => (&seq[..pos], qual.map(|q| &q[..pos.min(q.len())]), Some(name)),
-        None => (seq, qual, None),
+
+    // 7. Per-read filters (after all trimming)
+    if !adapters::passes_filters(seq, qual, config.min_avg_quality, config.max_n_bases) {
+        return None;
     }
+    if seq.len() < config.min_length as usize {
+        return None;
+    }
+
+    Some((seq, qual, adapter_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -339,6 +424,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut adapter_hits = 0u64;
     let mut trimmed_reads = 0u64;
     let mut trimmed_bases_removed = 0u64;
+    let mut reads_filtered = 0u64;
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
     let mut bytes = 0u64;
@@ -405,8 +491,12 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         let acc: BatchAccum = batch
             .par_iter()
             .fold(BatchAccum::default, move |mut acc, rec| {
-                let (effective_seq, effective_qual, adapter_name) =
-                    trim_record(&rec.seq, rec.qual.as_deref(), cfg);
+                let Some((effective_seq, effective_qual, adapter_name)) =
+                    trim_record(&rec.seq, rec.qual.as_deref(), cfg)
+                else {
+                    acc.reads_filtered += 1;
+                    return acc;
+                };
                 let tile_info = if per_tile_enabled {
                     parse_illumina_tile(&rec.id).and_then(|tile_id| {
                         effective_qual.map(|q| {
@@ -454,15 +544,14 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         // --- Trim output (sequential to preserve order) ---
         if config.trim_output {
             for rec in &batch {
-                let (trimmed_seq, trimmed_qual, adapter_name) =
-                    trim_record(&rec.seq, rec.qual.as_deref(), config);
-                if let Some(name) = adapter_name {
-                    trimmed_bases_removed += rec.seq.len() as u64 - trimmed_seq.len() as u64;
-                    *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
-                }
-                let keep = trimmed_seq.len() as u64 >= config.min_length;
-                if keep {
-                    if adapter_name.is_some() { trimmed_reads += 1; }
+                if let Some((trimmed_seq, trimmed_qual, adapter_name)) =
+                    trim_record(&rec.seq, rec.qual.as_deref(), config)
+                {
+                    if let Some(name) = adapter_name {
+                        trimmed_bases_removed += rec.seq.len() as u64 - trimmed_seq.len() as u64;
+                        *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
+                        trimmed_reads += 1;
+                    }
                     if let Some(ref mut w) = trim_writer {
                         if let Err(e) = write_fastq_record(w, &rec.id, trimmed_seq, trimmed_qual) {
                             state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
@@ -481,6 +570,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             &mut base_composition, &mut quality_distribution, &mut per_tile,
             &mut quality_by_length_bin,
         );
+        reads_filtered += acc.reads_filtered;
 
         // GC per-read distribution (reuses already-computed per-batch data)
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
@@ -551,6 +641,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.adapter_hits          = adapter_hits;
         cur.trimmed_reads         = trimmed_reads;
         cur.trimmed_bases_removed = trimmed_bases_removed;
+        cur.reads_filtered        = reads_filtered;
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = file_size;
@@ -639,6 +730,7 @@ fn process_single_file_mmap(
     let mut adapter_hits      = 0u64;
     let mut trimmed_reads     = 0u64;
     let mut trimmed_bases_removed = 0u64;
+    let mut reads_filtered    = 0u64;
     let mut min_length        = u64::MAX;
     let mut max_length        = 0u64;
     let mut bytes             = 0u64;
@@ -706,8 +798,12 @@ fn process_single_file_mmap(
                 let id   = range.id(mmap_bytes);
                 let seq  = range.seq(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
-                let (eff_seq, eff_qual, adapter_name) =
-                    trim_record(seq, Some(qual), config);
+                let Some((eff_seq, eff_qual, adapter_name)) =
+                    trim_record(seq, Some(qual), config)
+                else {
+                    acc.reads_filtered += 1;
+                    return acc;
+                };
                 let tile_info = if per_tile_enabled {
                     parse_illumina_tile(id).and_then(|tile_id| {
                         eff_qual.map(|q| {
@@ -752,14 +848,14 @@ fn process_single_file_mmap(
                 let seq  = range.seq(mmap_bytes);
                 let id   = range.id(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
-                let (trimmed_seq, trimmed_qual, adapter_name) =
-                    trim_record(seq, Some(qual), config);
-                if let Some(name) = adapter_name {
-                    trimmed_bases_removed += seq.len() as u64 - trimmed_seq.len() as u64;
-                    *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
-                }
-                if trimmed_seq.len() as u64 >= config.min_length {
-                    if adapter_name.is_some() { trimmed_reads += 1; }
+                if let Some((trimmed_seq, trimmed_qual, adapter_name)) =
+                    trim_record(seq, Some(qual), config)
+                {
+                    if let Some(name) = adapter_name {
+                        trimmed_bases_removed += seq.len() as u64 - trimmed_seq.len() as u64;
+                        *trimmed_by_adapter.entry(name.to_string()).or_insert(0) += 1;
+                        trimmed_reads += 1;
+                    }
                     if let Some(ref mut w) = trim_writer {
                         if let Err(e) = io::write_fastq_record(w, id, trimmed_seq, trimmed_qual) {
                             state.lock().unwrap().log(LogLevel::Warning, format!("Trim write error: {}", e));
@@ -778,6 +874,7 @@ fn process_single_file_mmap(
             &mut base_composition, &mut quality_distribution, &mut per_tile,
             &mut quality_by_length_bin,
         );
+        reads_filtered += acc.reads_filtered;
 
         // GC per-read distribution (reuses already-computed per-batch data)
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
@@ -844,6 +941,7 @@ fn process_single_file_mmap(
         cur.adapter_hits          = adapter_hits;
         cur.trimmed_reads         = trimmed_reads;
         cur.trimmed_bases_removed = trimmed_bases_removed;
+        cur.reads_filtered        = reads_filtered;
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = file_size;
@@ -957,6 +1055,7 @@ fn process_paired_files(
     let mut q20_bases = 0u64;
     let mut q30_bases = 0u64;
     let mut adapter_hits = 0u64;
+    let mut reads_filtered = 0u64;
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
     let mut bytes = 0u64;
@@ -1023,8 +1122,12 @@ fn process_paired_files(
             .par_iter()
             .fold(BatchAccum::default, move |mut acc, (r1, r2)| {
                 for rec in [r1, r2] {
-                    let (eff_seq, eff_qual, adapter_name) =
-                        trim_record(&rec.seq, rec.qual.as_deref(), config);
+                    let Some((eff_seq, eff_qual, adapter_name)) =
+                        trim_record(&rec.seq, rec.qual.as_deref(), config)
+                    else {
+                        acc.reads_filtered += 1;
+                        continue;
+                    };
                     let tile_info = if per_tile_enabled {
                         parse_illumina_tile(&rec.id).and_then(|tile_id| {
                             eff_qual.map(|q| {
@@ -1074,6 +1177,7 @@ fn process_paired_files(
             &mut base_composition, &mut quality_distribution, &mut per_tile,
             &mut quality_by_length_bin,
         );
+        reads_filtered += acc.reads_filtered;
 
         // GC per-read distribution (reuses already-computed per-batch data)
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
@@ -1130,6 +1234,7 @@ fn process_paired_files(
         cur.q20_bases             = q20_bases;
         cur.q30_bases             = q30_bases;
         cur.adapter_hits          = adapter_hits;
+        cur.reads_filtered        = reads_filtered;
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = r1_size + r2_size;
