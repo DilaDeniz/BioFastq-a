@@ -3,7 +3,7 @@ name = "biofastq-a"
 version = "2.2.0"
 edition = "2021"
 description = "BioFastq-A - High-performance FASTQ/FASTA quality analysis with HTML reports"
-license = "Apache-2.0"
+license = "MIT"
 
 [dependencies]
 needletail = "0.7"
