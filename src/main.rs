@@ -54,6 +54,9 @@ QC MODULE TOGGLES:
   --fast              Quick mode: disables kmer, duplication, per-tile, overrep
 
 OUTPUT OPTIONS:
+  --long-read         Force long-read mode (ONT / PacBio). Auto-detected when
+                      read headers contain ch= + start_time= (ONT) or when
+                      median read length of first 1000 reads exceeds 1000 bp.
   --no-html           Skip HTML report generation
   --no-json           Skip JSON report generation
   --multiqc           Write a MultiQC-compatible <stem>_mqc.json file
@@ -113,6 +116,7 @@ struct CliConfig {
     no_json: bool,
     fast: bool,
     multiqc: bool,
+    long_read: bool,
     // New trimming/filtering options
     poly_g: bool,
     poly_g_min: u8,
@@ -161,6 +165,7 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut no_json = false;
     let mut fast = false;
     let mut multiqc = false;
+    let mut long_read = false;
     let mut poly_g = false;
     let mut poly_g_min: u8 = 0;
     let mut poly_x = false;
@@ -279,6 +284,7 @@ fn parse_args() -> Result<CliConfig, String> {
             "--no-json" => no_json = true,
             "--fast" => fast = true,
             "--multiqc" => multiqc = true,
+            "--long-read" => long_read = true,
             "--in2" => {
                 i += 1;
                 if i >= args.len() {
@@ -331,6 +337,7 @@ fn parse_args() -> Result<CliConfig, String> {
         no_json,
         fast,
         multiqc,
+        long_read,
         poly_g,
         poly_g_min,
         poly_x,
@@ -480,6 +487,7 @@ fn main() {
     process_config.trim_tail_bases  = cfg.trim_tail;
     process_config.min_avg_quality  = cfg.min_quality;
     process_config.max_n_bases      = cfg.max_n;
+    process_config.is_long_read     = cfg.long_read;
 
     let n_files = cfg.input_files.len();
     let state = Arc::new(Mutex::new(SharedState::new(n_files)));

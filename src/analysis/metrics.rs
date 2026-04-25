@@ -40,6 +40,13 @@ pub struct BatchAccum {
     pub gc_per_read: [u64; 101],
     /// Reads discarded by per-read quality/N filters — incremented by caller in mod.rs.
     pub reads_filtered: u64,
+    /// ONT channel → read count (only populated when long-read/ONT mode is active).
+    pub ont_channel_counts: HashMap<u32, u32>,
+    /// Sampled (read_length, mean_phred) points for quality-vs-length scatter.
+    pub qual_vs_length: Vec<(u32, f32)>,
+    /// Raw (unix_timestamp_secs, 1) pairs from ONT start_time headers.
+    /// Merged and bucketed into 5-minute intervals during finalization.
+    pub reads_over_time_raw: Vec<(u64, u64)>,
 }
 
 impl Default for BatchAccum {
@@ -66,6 +73,9 @@ impl Default for BatchAccum {
             quality_by_length_bin: HashMap::new(),
             gc_per_read: [0u64; 101],
             reads_filtered: 0,
+            ont_channel_counts: HashMap::new(),
+            qual_vs_length: Vec::new(),
+            reads_over_time_raw: Vec::new(),
         }
     }
 }
@@ -197,6 +207,11 @@ impl BatchAccum {
         self.reads_filtered += other.reads_filtered;
         self.kmer_seqs.extend(other.kmer_seqs);
         self.fingerprints.extend(other.fingerprints);
+        for (ch, cnt) in other.ont_channel_counts {
+            *self.ont_channel_counts.entry(ch).or_insert(0) += cnt;
+        }
+        self.qual_vs_length.extend(other.qual_vs_length);
+        self.reads_over_time_raw.extend(other.reads_over_time_raw);
         self
     }
 }

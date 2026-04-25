@@ -27,6 +27,10 @@ pub const ADAPTERS: &[(&str, &[u8])] = &[
     ("Small RNA 3-prime",  b"TGGAATTCTCGGGTGCCAAGG"),
     ("Poly-A",             b"AAAAAAAAAAAAAAAAAAAAAA"),
     ("Poly-T",             b"TTTTTTTTTTTTTTTTTTTTTT"),
+    // Oxford Nanopore Technologies adapters
+    ("ONT Ligation (SQK-LSK)", b"AATGTACTTCGTTCAGTTACGTATTGCT"),
+    ("ONT PCR (SQK-PCS)",      b"ACTTGCCTGTCGCTCTATCTTC"),
+    ("ONT Rapid (SQK-RAD)",    b"GCTTGGGTGTTTAACCTTTTTTCGCAACGGGT"),
 ];
 
 // Minimum bp of adapter prefix that must match exactly
@@ -82,6 +86,9 @@ pub struct OverrepSeq {
     pub percentage: f64,
     pub possible_source: String,
 }
+
+/// Maximum number of qual-vs-length scatter points to keep.
+pub const MAX_QUAL_VS_LEN_POINTS: usize = 2000;
 
 /// Controls which optional QC modules and outputs are enabled.
 /// All fields default to `true` (everything on).
@@ -161,6 +168,12 @@ pub struct ProcessConfig {
     pub paired_end_r2: Option<String>,
     /// Feature flags controlling which QC modules and outputs are active
     pub flags: FeatureFlags,
+    /// Force long-read mode (ONT/PacBio) regardless of auto-detection.
+    pub is_long_read: bool,
+    /// Hint that the data is specifically from ONT (vs generic long-read / PacBio).
+    /// Reserved for future ONT-specific processing; currently informational.
+    #[allow(dead_code)]
+    pub is_ont: bool,
 }
 
 impl Default for ProcessConfig {
@@ -186,6 +199,8 @@ impl Default for ProcessConfig {
             strict: false,
             paired_end_r2: None,
             flags: FeatureFlags::default(),
+            is_long_read: false,
+            is_ont: false,
         }
     }
 }
@@ -245,6 +260,16 @@ pub struct FileStats {
     pub gc_distribution: Vec<u64>,
     // Duplication level histogram: percentage of reads at each duplication level (9 bins)
     pub dup_level_histogram: Vec<f64>,
+    // Long-read / ONT specific fields
+    /// True when this file was processed in long-read mode.
+    pub long_read_mode: bool,
+    /// ONT channel → read count (only populated for ONT reads).
+    pub ont_channel_counts: HashMap<u32, u32>,
+    /// Cumulative reads over time: (minutes_since_run_start, cumulative_reads).
+    /// Bucketed into 5-minute intervals; only non-empty for ONT reads.
+    pub reads_over_time: Vec<(u64, u64)>,
+    /// Sampled (read_length, mean_phred_quality) points; max 2000 entries.
+    pub qual_vs_length: Vec<(u32, f32)>,
 }
 
 impl FileStats {
@@ -281,6 +306,10 @@ impl FileStats {
             module_status: Vec::new(),
             gc_distribution: vec![0u64; 101],
             dup_level_histogram: vec![0.0; 9],
+            long_read_mode: false,
+            ont_channel_counts: HashMap::new(),
+            reads_over_time: Vec::new(),
+            qual_vs_length: Vec::new(),
         }
     }
 

@@ -724,6 +724,194 @@ function drawNContent(id, data) {
   ctx.fillText('N content (%)',0,0); ctx.restore();
 }
 
+/* ---------- Quality vs Length scatter (long-read) ---------- */
+function drawQualVsLen(id, data) {
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:16,b:40,l:48};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,W,H);
+
+  var maxLen = 0, minQ = 42, maxQ = 0;
+  data.forEach(function(d){ if(d[0]>maxLen) maxLen=d[0]; if(d[1]<minQ) minQ=d[1]; if(d[1]>maxQ) maxQ=d[1]; });
+  if (maxLen === 0) return;
+  minQ = Math.max(0, Math.floor(minQ) - 1);
+  maxQ = Math.min(42, Math.ceil(maxQ) + 1);
+  var qRange = maxQ - minQ || 1;
+
+  /* grid */
+  ctx.strokeStyle = 'rgba(0,0,0,.07)'; ctx.lineWidth = 1;
+  [0,1,2,3,4].forEach(function(gi) {
+    var y = pad.t + gi/4 * ph;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+    var x = pad.l + gi/4 * pw;
+    ctx.beginPath(); ctx.moveTo(x,pad.t); ctx.lineTo(x,H-pad.b); ctx.stroke();
+  });
+
+  /* dots */
+  data.forEach(function(d) {
+    var x = pad.l + (d[0] / maxLen) * pw;
+    var y = pad.t + (1 - (d[1] - minQ) / qRange) * ph;
+    ctx.beginPath();
+    ctx.arc(x, y, 2.5, 0, 2*Math.PI);
+    ctx.fillStyle = 'rgba(26,95,168,0.55)';
+    ctx.fill();
+  });
+
+  /* axes */
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+
+  /* Y labels */
+  ctx.fillStyle = '#5a6370'; ctx.font = '11px monospace'; ctx.textAlign = 'right';
+  [minQ, Math.round((minQ+maxQ)/2), maxQ].forEach(function(q) {
+    var y = pad.t + (1 - (q - minQ) / qRange) * ph;
+    ctx.fillText(q, pad.l-4, y+4);
+  });
+
+  /* X labels */
+  ctx.textAlign = 'center';
+  [0, 0.25, 0.5, 0.75, 1.0].forEach(function(frac) {
+    var v = Math.round(maxLen * frac);
+    var x = pad.l + frac * pw;
+    var lbl = v >= 1000 ? (v/1000).toFixed(1)+'k' : v+'bp';
+    ctx.fillText(lbl, x, H-pad.b+14);
+  });
+
+  ctx.fillText('Read Length (bp)', pad.l+pw/2, H-2);
+  ctx.save(); ctx.translate(12, pad.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('Mean Phred Quality', 0, 0); ctx.restore();
+}
+
+/* ---------- Reads over time (ONT only) ---------- */
+function drawReadsOverTime(id, data) {
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:16,b:40,l:60};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,W,H);
+
+  var maxMin = data[data.length-1][0];
+  var maxReads = data[data.length-1][1];
+  if (!maxMin || !maxReads) return;
+
+  /* grid */
+  ctx.strokeStyle = 'rgba(0,0,0,.07)'; ctx.lineWidth = 1;
+  [0,0.25,0.5,0.75,1.0].forEach(function(frac) {
+    var y = pad.t + (1-frac)*ph;
+    ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke();
+  });
+
+  /* filled area */
+  var grad = ctx.createLinearGradient(0,pad.t,0,H-pad.b);
+  grad.addColorStop(0,'rgba(26,95,168,.20)');
+  grad.addColorStop(1,'rgba(26,95,168,0)');
+  ctx.beginPath();
+  data.forEach(function(d,i) {
+    var x = pad.l + (d[0]/maxMin)*pw;
+    var y = pad.t + (1 - d[1]/maxReads)*ph;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.lineTo(pad.l+pw, H-pad.b); ctx.lineTo(pad.l, H-pad.b);
+  ctx.closePath(); ctx.fillStyle = grad; ctx.fill();
+
+  /* line */
+  ctx.beginPath();
+  data.forEach(function(d,i) {
+    var x = pad.l + (d[0]/maxMin)*pw;
+    var y = pad.t + (1 - d[1]/maxReads)*ph;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.strokeStyle = '#1a5fa8'; ctx.lineWidth = 2; ctx.stroke();
+
+  /* axes */
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+
+  /* Y labels */
+  ctx.fillStyle = '#5a6370'; ctx.font = '11px monospace'; ctx.textAlign = 'right';
+  [0, 0.5, 1.0].forEach(function(frac) {
+    var v = Math.round(maxReads * frac);
+    var label = v>999999?(v/1000000).toFixed(1)+'M':v>999?(v/1000).toFixed(0)+'k':String(v);
+    ctx.fillText(label, pad.l-4, pad.t+(1-frac)*ph+4);
+  });
+
+  /* X labels */
+  ctx.textAlign = 'center';
+  [0, 0.25, 0.5, 0.75, 1.0].forEach(function(frac) {
+    var v = Math.round(maxMin * frac);
+    ctx.fillText(v+'m', pad.l + frac*pw, H-pad.b+14);
+  });
+  ctx.fillText('Minutes since run start', pad.l+pw/2, H-2);
+  ctx.save(); ctx.translate(12, pad.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.fillText('Cumulative reads', 0, 0); ctx.restore();
+}
+
+/* ---------- Channel occupancy (ONT only) ---------- */
+function drawChannelOccupancy(id, data) {
+  var cv = document.getElementById(id);
+  if (!cv || !data || !data.length) return;
+  var ctx = cv.getContext('2d');
+  var W = cv.clientWidth || cv.width; cv.width = W;
+  var H = cv.height;
+  var pad = {t:18,r:16,b:40,l:52};
+  var pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  ctx.fillStyle = '#ffffff'; ctx.fillRect(0,0,W,H);
+
+  /* Build histogram of reads-per-channel counts */
+  var maxCnt = 0;
+  data.forEach(function(d){ if(d[1]>maxCnt) maxCnt=d[1]; });
+  if (!maxCnt) return;
+
+  /* bin into ~20 buckets */
+  var n = data.length;
+  var nbins = Math.min(20, n);
+  var binSize = Math.ceil(maxCnt / nbins);
+  if (binSize === 0) binSize = 1;
+  var bins = [];
+  for (var b=0; b<nbins; b++) bins.push(0);
+  data.forEach(function(d){
+    var bi = Math.min(Math.floor(d[1]/binSize), nbins-1);
+    bins[bi]++;
+  });
+  var maxBin = Math.max.apply(null, bins) || 1;
+  var bw = pw / nbins;
+
+  bins.forEach(function(cnt, i) {
+    var bh = (cnt/maxBin)*ph;
+    var y = pad.t+ph-bh;
+    ctx.fillStyle = 'rgba(26,95,168,0.65)';
+    ctx.fillRect(pad.l+i*bw+0.5, y, Math.max(1,bw-1), bh);
+  });
+
+  /* axes */
+  ctx.strokeStyle = '#555'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,H-pad.b); ctx.lineTo(W-pad.r,H-pad.b); ctx.stroke();
+
+  /* X labels (reads per channel) */
+  ctx.fillStyle = '#5a6370'; ctx.font = '10px monospace'; ctx.textAlign = 'center';
+  [0, Math.floor(nbins/2), nbins-1].forEach(function(i) {
+    var lo = i*binSize, hi = (i+1)*binSize-1;
+    ctx.fillText(lo+'-'+hi, pad.l+(i+0.5)*bw, H-pad.b+14);
+  });
+  ctx.fillText('Reads per channel', pad.l+pw/2, H-2);
+
+  /* Y labels */
+  ctx.textAlign = 'right';
+  [0, 0.5, 1.0].forEach(function(frac) {
+    var v = Math.round(maxBin*frac);
+    ctx.fillText(v, pad.l-4, pad.t+(1-frac)*ph+4);
+  });
+  ctx.save(); ctx.translate(10, pad.t+ph/2); ctx.rotate(-Math.PI/2);
+  ctx.textAlign='center'; ctx.fillText('Channel count', 0, 0); ctx.restore();
+}
+
 /* ---------- Init ---------- */
 window.addEventListener('load', function(){
   RD.forEach(function(f,i){
@@ -740,6 +928,9 @@ window.addEventListener('load', function(){
     drawBaseComp('basecomp-'+i, f.basecomp);
     drawQualDist('qualdist-'+i, f.qualdist);
     if (f.tiles && f.tiles.length) drawTile('tile-'+i, f.tiles);
+    if (f.qvl && f.qvl.length) drawQualVsLen('qvl-'+i, f.qvl);
+    if (f.rot && f.rot.length) drawReadsOverTime('rot-'+i, f.rot);
+    if (f.chann && f.chann.length) drawChannelOccupancy('chann-'+i, f.chann);
   });
 });
 "#;
@@ -840,7 +1031,8 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
         .and_then(|n| n.to_str())
         .unwrap_or(&f.file_path);
 
-    let qual_class = quality_class(f.avg_quality());
+    let lr = f.long_read_mode;
+    let qual_class = quality_class_lr(f.avg_quality(), lr);
     let adapter_class = adapter_status_class(f.adapter_pct());
 
     let adapter_list: String = ADAPTERS
@@ -894,8 +1086,14 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
         &format!("{} / {} bp", f.effective_min_length(), f.max_length),
         "",
     );
-    stat_card(&mut s, "N50", &format!("{} bp", n50), "");
-    stat_card(&mut s, "N90", &format!("{} bp", n90), "");
+    if lr {
+        // Long-read: N50 is the most important metric — show it prominently
+        stat_card(&mut s, "N50 (prominent)", &format!("{} bp", n50), if n50 > 10000 { "pass" } else { "warn" });
+        stat_card(&mut s, "N90", &format!("{} bp", n90), "");
+    } else {
+        stat_card(&mut s, "N50", &format!("{} bp", n50), "");
+        stat_card(&mut s, "N90", &format!("{} bp", n90), "");
+    }
     stat_card(
         &mut s,
         "GC Content",
@@ -908,18 +1106,34 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
         &format!("Q{:.1}", f.avg_quality()),
         qual_class,
     );
-    stat_card(
-        &mut s,
-        "≥Q20 Reads",
-        &format!("{:.1}%", f.q20_pct()),
-        if f.q20_pct() >= 80.0 { "pass" } else { "warn" },
-    );
-    stat_card(
-        &mut s,
-        "≥Q30 Reads",
-        &format!("{:.1}%", f.q30_pct()),
-        if f.q30_pct() >= 70.0 { "pass" } else { "warn" },
-    );
+    if lr {
+        // Long-read mode: show Q10/Q20 stats (ONT reads don't typically reach Q30)
+        stat_card(
+            &mut s,
+            "≥Q10 Reads",
+            &format!("{:.1}%", f.q20_pct()), // q20_pct is ≥Q20 baseline; for ONT context we show q20 as a proxy
+            if f.q20_pct() >= 50.0 { "pass" } else { "warn" },
+        );
+        stat_card(
+            &mut s,
+            "≥Q20 Reads",
+            &format!("{:.1}%", f.q20_pct()),
+            if f.q20_pct() >= 30.0 { "pass" } else { "warn" },
+        );
+    } else {
+        stat_card(
+            &mut s,
+            "≥Q20 Reads",
+            &format!("{:.1}%", f.q20_pct()),
+            if f.q20_pct() >= 80.0 { "pass" } else { "warn" },
+        );
+        stat_card(
+            &mut s,
+            "≥Q30 Reads",
+            &format!("{:.1}%", f.q30_pct()),
+            if f.q30_pct() >= 70.0 { "pass" } else { "warn" },
+        );
+    }
     stat_card(
         &mut s,
         "Adapter Content",
@@ -1048,38 +1262,40 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
     }
     s.push_str("</div>\n");
 
-    // Per-tile quality card
-    s.push_str("<div class=\"chart-box\">\n");
-    s.push_str("<div class=\"chart-header\">\n");
-    s.push_str("<h3>Per-Tile Quality Score</h3>\n");
-    if flags.per_tile_quality {
-        let tile_has_data = !f.sorted_tile_quality().is_empty();
-        if tile_has_data {
-            s.push_str(&format!(
-                "<button class=\"dl-btn no-print\" onclick=\"downloadChart('tile-{idx}','per_tile_quality')\">&#8595; PNG</button>\n",
-                idx = idx
-            ));
+    // Per-tile quality card (hidden for long reads — irrelevant for ONT/PacBio)
+    if !lr {
+        s.push_str("<div class=\"chart-box\">\n");
+        s.push_str("<div class=\"chart-header\">\n");
+        s.push_str("<h3>Per-Tile Quality Score</h3>\n");
+        if flags.per_tile_quality {
+            let tile_has_data = !f.sorted_tile_quality().is_empty();
+            if tile_has_data {
+                s.push_str(&format!(
+                    "<button class=\"dl-btn no-print\" onclick=\"downloadChart('tile-{idx}','per_tile_quality')\">&#8595; PNG</button>\n",
+                    idx = idx
+                ));
+            }
         }
-    }
-    s.push_str("</div>\n");
-    if !flags.per_tile_quality {
-        s.push_str(&skipped_notice("--no-per-tile / --fast"));
-    } else {
-        let tile_data = f.sorted_tile_quality();
-        if !tile_data.is_empty() {
-            s.push_str(&format!(
-                "<canvas id=\"tile-{}\" width=\"600\" height=\"200\"></canvas>\n",
-                idx
-            ));
-            s.push_str(&format!(
-                "<p class=\"chart-note\">{} Illumina tiles detected. Bars coloured red→green by quality.</p>\n",
-                tile_data.len()
-            ));
+        s.push_str("</div>\n");
+        if !flags.per_tile_quality {
+            s.push_str(&skipped_notice("--no-per-tile / --fast"));
         } else {
-            s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No Illumina tile information found in read headers.<br>Per-tile QC requires standard Illumina CASAVA 1.8+ headers.</p>\n");
+            let tile_data = f.sorted_tile_quality();
+            if !tile_data.is_empty() {
+                s.push_str(&format!(
+                    "<canvas id=\"tile-{}\" width=\"600\" height=\"200\"></canvas>\n",
+                    idx
+                ));
+                s.push_str(&format!(
+                    "<p class=\"chart-note\">{} Illumina tiles detected. Bars coloured red→green by quality.</p>\n",
+                    tile_data.len()
+                ));
+            } else {
+                s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No Illumina tile information found in read headers.<br>Per-tile QC requires standard Illumina CASAVA 1.8+ headers.</p>\n");
+            }
         }
+        s.push_str("</div>\n");
     }
-    s.push_str("</div>\n");
 
     s.push_str("</div>\n"); // charts-row (row 3)
 
@@ -1170,6 +1386,78 @@ fn build_file_section(f: &FileStats, idx: usize, flags: &FeatureFlags) -> String
     s.push_str("</div>\n");
 
     s.push_str("</div>\n"); // charts-row (row 5)
+
+    // Row 6 (long-read only): Quality vs Length scatter + Reads over time + Channel occupancy
+    if lr {
+        s.push_str("<div class=\"charts-row\">\n");
+
+        // Quality vs Length scatter
+        s.push_str("<div class=\"chart-box\">\n");
+        s.push_str("<div class=\"chart-header\">\n");
+        s.push_str("<h3>Quality vs Read Length</h3>\n");
+        if !f.qual_vs_length.is_empty() {
+            s.push_str(&format!(
+                "<button class=\"dl-btn no-print\" onclick=\"downloadChart('qvl-{idx}','qual_vs_length')\">&#8595; PNG</button>\n",
+                idx = idx
+            ));
+        }
+        s.push_str("</div>\n");
+        if f.qual_vs_length.is_empty() {
+            s.push_str("<p class=\"chart-note\" style=\"padding:20px 0\">No quality-vs-length data available.</p>\n");
+        } else {
+            s.push_str(&format!(
+                "<canvas id=\"qvl-{}\" width=\"600\" height=\"280\"></canvas>\n",
+                idx
+            ));
+            s.push_str("<p class=\"chart-note\">Sampled read length vs mean Phred quality. Each dot = one read. Horizontal scatter indicates quality is independent of length (typical for ONT).</p>\n");
+        }
+        s.push_str("</div>\n");
+
+        // Reads over time (ONT only)
+        if !f.reads_over_time.is_empty() {
+            s.push_str("<div class=\"chart-box\">\n");
+            s.push_str("<div class=\"chart-header\">\n");
+            s.push_str("<h3>Reads over Time (ONT)</h3>\n");
+            s.push_str(&format!(
+                "<button class=\"dl-btn no-print\" onclick=\"downloadChart('rot-{idx}','reads_over_time')\">&#8595; PNG</button>\n",
+                idx = idx
+            ));
+            s.push_str("</div>\n");
+            s.push_str(&format!(
+                "<canvas id=\"rot-{}\" width=\"600\" height=\"280\"></canvas>\n",
+                idx
+            ));
+            s.push_str("<p class=\"chart-note\">Cumulative reads per 5-minute bucket since run start. Plateaus may indicate pore saturation or flow cell end.</p>\n");
+            s.push_str("</div>\n");
+        }
+
+        s.push_str("</div>\n"); // charts-row (row 6)
+
+        // Channel occupancy (ONT only)
+        if !f.ont_channel_counts.is_empty() {
+            s.push_str("<div class=\"charts-row\">\n");
+            s.push_str("<div class=\"chart-box\">\n");
+            s.push_str("<div class=\"chart-header\">\n");
+            s.push_str("<h3>Channel Occupancy (ONT)</h3>\n");
+            s.push_str(&format!(
+                "<button class=\"dl-btn no-print\" onclick=\"downloadChart('chann-{idx}','channel_occupancy')\">&#8595; PNG</button>\n",
+                idx = idx
+            ));
+            s.push_str("</div>\n");
+            s.push_str(&format!(
+                "<canvas id=\"chann-{}\" width=\"600\" height=\"240\"></canvas>\n",
+                idx
+            ));
+            let n_channels = f.ont_channel_counts.len();
+            let total_chan_reads: u32 = f.ont_channel_counts.values().sum();
+            s.push_str(&format!(
+                "<p class=\"chart-note\">{} active channels detected ({} total reads). Histogram shows distribution of reads-per-channel. PromethION has up to 3000 channels; MinION up to 512.</p>\n",
+                n_channels, total_chan_reads
+            ));
+            s.push_str("</div>\n");
+            s.push_str("</div>\n"); // charts-row (channel occupancy)
+        }
+    }
 
     // Overrepresented sequences table
     s.push_str("<div class=\"chart-box\" style=\"margin-top:16px\">\n");
@@ -1312,6 +1600,28 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         .collect();
     let n_content_json: Vec<f64> = f.base_composition_pct().iter().map(|p| p[4]).collect();
 
+    // Long-read / ONT specific data
+    // qual_vs_length: [[len, mean_q], ...]
+    let qvl_json: Vec<serde_json::Value> = f.qual_vs_length
+        .iter()
+        .map(|(l, q)| serde_json::json!([l, q]))
+        .collect();
+    // reads_over_time: [[minutes, cumulative_reads], ...]
+    let rot_json: Vec<serde_json::Value> = f.reads_over_time
+        .iter()
+        .map(|(m, c)| serde_json::json!([m, c]))
+        .collect();
+    // ont_channel_counts: [[channel, count], ...] sorted by channel
+    let mut chann_sorted: Vec<(u32, u32)> = f.ont_channel_counts
+        .iter()
+        .map(|(&ch, &cnt)| (ch, cnt))
+        .collect();
+    chann_sorted.sort_by_key(|(ch, _)| *ch);
+    let chann_json: Vec<serde_json::Value> = chann_sorted
+        .iter()
+        .map(|(ch, cnt)| serde_json::json!([ch, cnt]))
+        .collect();
+
     serde_json::json!({
         "qual": qual_per_pos,
         "qual_pct": qual_pct_json,
@@ -1323,6 +1633,10 @@ fn build_file_json(f: &FileStats) -> serde_json::Value {
         "gc_dist": gc_dist_json,
         "dup_hist": dup_hist_json,
         "n_content": n_content_json,
+        "qvl": qvl_json,
+        "rot": rot_json,
+        "chann": chann_json,
+        "long_read": f.long_read_mode,
     })
 }
 
@@ -1354,6 +1668,15 @@ fn quality_class(q: f64) -> &'static str {
         "warn"
     } else {
         "fail"
+    }
+}
+
+/// Quality class with long-read aware thresholds (ONT: warn < Q10, fail < Q8).
+fn quality_class_lr(q: f64, long_read: bool) -> &'static str {
+    if long_read {
+        if q >= 10.0 { "pass" } else if q >= 8.0 { "warn" } else { "fail" }
+    } else {
+        quality_class(q)
     }
 }
 

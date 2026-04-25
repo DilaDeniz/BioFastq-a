@@ -17,8 +17,8 @@ use rayon::prelude::*;
 
 use crate::types::{
     format_number, FileStats, LogLevel, OverrepSeq, ProcessConfig, ProcessingStatus,
-    QcStatus, SharedState, ADAPTER_MATCH_LEN, ADAPTERS, FLUSH_INTERVAL, OVERREP_SAMPLE,
-    PARALLEL_BATCH, PHRED_BUCKETS,
+    QcStatus, SharedState, ADAPTER_MATCH_LEN, ADAPTERS, FLUSH_INTERVAL,
+    MAX_QUAL_VS_LEN_POINTS, OVERREP_SAMPLE, PARALLEL_BATCH, PHRED_BUCKETS,
 };
 
 use self::io::{open_writer, write_fastq_record};
@@ -219,17 +219,31 @@ fn finish_overrep(
 /// Compute FastQC-style per-module pass/warn/fail from finished FileStats.
 fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
     let mut m = Vec::with_capacity(8);
+    let lr = f.long_read_mode;
 
     // Per-base sequence quality — worst position average
+    // Long-read: ONT Q-scores are lower by design (Q8-Q20 typical)
     let qual_per_pos = f.avg_qual_per_position();
     let min_pos_q = qual_per_pos.iter().cloned().fold(f64::MAX, f64::min);
-    m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
-        else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    if lr {
+        m.push(("Per-base quality".into(), if min_pos_q >= 10.0 { QcStatus::Pass }
+            else if min_pos_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    } else {
+        m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
+            else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    }
 
-    // Per-sequence quality (Q30 %)
-    let q30 = f.q30_pct();
-    m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
-        else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    // Per-sequence quality
+    // Long-read mode: use Q10 warn / Q8 fail thresholds; compare mean quality not Q30%
+    if lr {
+        let avg_q = f.avg_quality();
+        m.push(("Per-sequence quality".into(), if avg_q >= 10.0 { QcStatus::Pass }
+            else if avg_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    } else {
+        let q30 = f.q30_pct();
+        m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
+            else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    }
 
     // Per-base sequence content — check A/T balance and C/G balance
     let bcomp = f.base_composition_pct();
@@ -256,14 +270,11 @@ fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
         else if max_n_pct < 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
 
     // Sequence length distribution.
-    // len_range == 0: all reads the same length (classic Illumina) → PASS.
-    // Small range: slight variation from quality trimming → WARN.
-    // Large range (>= 50bp): significant variation; could be long-read data or
-    // heavily-trimmed data — flag it so the user is aware, but don't FAIL since
-    // it is expected for ONT/PacBio or adapter-trimmed libraries.
+    // Long-read: variable length is expected and normal → always Pass.
+    // Short-read: len_range == 0 (all same) → Pass; any variation → Warn.
     let len_range = f.max_length.saturating_sub(f.effective_min_length());
-    m.push(("Sequence length".into(), if len_range == 0 { QcStatus::Pass }
-        else { QcStatus::Warn }));
+    m.push(("Sequence length".into(),
+        if lr || len_range == 0 { QcStatus::Pass } else { QcStatus::Warn }));
 
     // Sequence duplication level
     m.push(("Duplication level".into(), if f.dup_rate_pct < 20.0 { QcStatus::Pass }
@@ -447,6 +458,15 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut gc_distribution = [0u64; 101];
     let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
     let mut dup_sample_count = 0usize;
+    // Long-read / ONT accumulators
+    let mut ont_channel_counts: HashMap<u32, u32> = HashMap::new();
+    let mut reads_over_time_raw: Vec<(u64, u64)> = Vec::new();
+    let mut qual_vs_length: Vec<(u32, f32)> = Vec::new();
+    // Auto-detection state
+    let mut first1k_lengths: Vec<u64> = Vec::with_capacity(1001);
+    let mut ont_header_detected = false;
+    let mut long_read_detected = false;
+    let mut detection_done = false;
 
     // --- Batch reading loop ---
     loop {
@@ -485,12 +505,38 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
         bytes += batch_bytes;
 
+        // --- Auto-detect long-read mode from first 1000 reads ---
+        if !detection_done && read_count + batch.len() as u64 >= 1000 {
+            detection_done = true;
+        }
+        if !detection_done || (read_count < 1000 && !first1k_lengths.is_empty()) {
+            for rec in &batch {
+                if first1k_lengths.len() < 1000 {
+                    first1k_lengths.push(rec.seq.len() as u64);
+                    if !ont_header_detected && is_ont_header(&rec.id) {
+                        ont_header_detected = true;
+                    }
+                }
+            }
+            if first1k_lengths.len() >= 1000 && !long_read_detected {
+                let med = median_length(&first1k_lengths);
+                if med > 1000 {
+                    long_read_detected = true;
+                }
+            }
+        }
+
+        let is_lr = config.is_long_read || long_read_detected || ont_header_detected;
+
         // --- Parallel stats computation ---
         let cfg = config;
         let per_tile_enabled = cfg.flags.per_tile_quality;
+        let cur_read_count = read_count;
+        let cur_qvl_len = qual_vs_length.len();
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, move |mut acc, rec| {
+            .enumerate()
+            .fold(BatchAccum::default, move |mut acc, (bi, rec)| {
                 let Some((effective_seq, effective_qual, adapter_name)) =
                     trim_record(&rec.seq, rec.qual.as_deref(), cfg)
                 else {
@@ -509,6 +555,38 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
                 };
                 let fp = fingerprint(effective_seq);
                 acc.process(effective_seq, effective_qual, tile_info, fp, adapter_name.is_some());
+                // Long-read ONT data
+                if is_lr {
+                    if let Some(ch) = parse_ont_channel(&rec.id) {
+                        *acc.ont_channel_counts.entry(ch).or_insert(0) += 1;
+                    }
+                    if let Some(ts) = parse_ont_start_time(&rec.id) {
+                        acc.reads_over_time_raw.push((ts, 1));
+                    }
+                    // Sample qual-vs-length: sample every Nth read to keep ~2000 points
+                    // N is chosen so that with the current batch offset we stay under cap
+                    let global_idx = cur_read_count + bi as u64;
+                    // sample 1 in every max(1, total_cap_factor) reads
+                    // Use a simple modulo: sample if global_idx % sample_every == 0
+                    // We don't know total reads; keep at most MAX_QUAL_VS_LEN_POINTS
+                    let already = cur_qvl_len + acc.qual_vs_length.len();
+                    let sample_n: u64 = if already < MAX_QUAL_VS_LEN_POINTS {
+                        // Rough estimate: sample every ~(total_est / max) reads
+                        // Use simple approach: every 50th read (gives 2000 for ~100k reads)
+                        50
+                    } else {
+                        u64::MAX // stop sampling
+                    };
+                    if sample_n < u64::MAX && global_idx.is_multiple_of(sample_n) {
+                        if let Some(q) = effective_qual {
+                            if !q.is_empty() {
+                                let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                                let mean_q = phred_sum as f32 / q.len() as f32;
+                                acc.qual_vs_length.push((effective_seq.len() as u32, mean_q));
+                            }
+                        }
+                    }
+                }
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
@@ -572,6 +650,18 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         );
         reads_filtered += acc.reads_filtered;
 
+        // Merge long-read data from batch accum
+        for (ch, cnt) in acc.ont_channel_counts {
+            *ont_channel_counts.entry(ch).or_insert(0) += cnt;
+        }
+        // Truncate qual_vs_length to MAX_QUAL_VS_LEN_POINTS
+        if qual_vs_length.len() < MAX_QUAL_VS_LEN_POINTS {
+            let remaining = MAX_QUAL_VS_LEN_POINTS - qual_vs_length.len();
+            let take = acc.qual_vs_length.len().min(remaining);
+            qual_vs_length.extend_from_slice(&acc.qual_vs_length[..take]);
+        }
+        reads_over_time_raw.extend(acc.reads_over_time_raw);
+
         // GC per-read distribution (reuses already-computed per-batch data)
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
             *dst += src;
@@ -621,6 +711,10 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
 
     drop(trim_writer);
 
+    // Finalize long-read mode
+    let is_long_read_final = config.is_long_read || long_read_detected || ont_header_detected;
+    let final_reads_over_time = bucket_reads_over_time(reads_over_time_raw);
+
     // HyperLogLog dup rate: (total - estimated_unique) / total
     let dup_rate = if config.flags.duplication_check && read_count > 0 {
         let unique_est = hll.len() as u64;
@@ -658,6 +752,10 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.overrepresented_sequences = overrep_seqs;
         cur.gc_distribution = gc_distribution.to_vec();
         cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
+        cur.long_read_mode = is_long_read_final;
+        cur.ont_channel_counts = ont_channel_counts;
+        cur.reads_over_time = final_reads_over_time;
+        cur.qual_vs_length = qual_vs_length;
         cur.module_status = compute_module_status(cur);
     }
 
@@ -751,6 +849,15 @@ fn process_single_file_mmap(
     let mut gc_distribution = [0u64; 101];
     let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
     let mut dup_sample_count = 0usize;
+    // Long-read / ONT accumulators (mmap path)
+    let mut ont_channel_counts_mm: HashMap<u32, u32> = HashMap::new();
+    let mut reads_over_time_raw_mm: Vec<(u64, u64)> = Vec::new();
+    let mut qual_vs_length_mm: Vec<(u32, f32)> = Vec::new();
+    // Auto-detection state (mmap path)
+    let mut first1k_lengths_mm: Vec<u64> = Vec::with_capacity(1001);
+    let mut ont_header_detected_mm = false;
+    let mut long_read_detected_mm = false;
+    let mut detection_done_mm = false;
 
     // Arc<Mmap> shared between the producer thread (via MmapFastq) and the
     // consumer (main thread).  Both deref to &[u8] for zero-copy access.
@@ -791,10 +898,38 @@ fn process_single_file_mmap(
     while let Ok((batch, batch_bytes)) = rx.recv() {
         bytes += batch_bytes;
 
+        // Auto-detect long-read mode from first 1000 reads (mmap path)
+        if !detection_done_mm && read_count + batch.len() as u64 >= 1000 {
+            detection_done_mm = true;
+        }
+        if !detection_done_mm || (read_count < 1000 && !first1k_lengths_mm.is_empty()) {
+            for range in &batch {
+                if first1k_lengths_mm.len() < 1000 {
+                    first1k_lengths_mm.push(range.seq_len as u64);
+                    if !ont_header_detected_mm {
+                        let id = range.id(mmap_bytes);
+                        if is_ont_header(id) {
+                            ont_header_detected_mm = true;
+                        }
+                    }
+                }
+            }
+            if first1k_lengths_mm.len() >= 1000 && !long_read_detected_mm {
+                let med = median_length(&first1k_lengths_mm);
+                if med > 1000 {
+                    long_read_detected_mm = true;
+                }
+            }
+        }
+
+        let is_lr_mm = config.is_long_read || long_read_detected_mm || ont_header_detected_mm;
         let per_tile_enabled = config.flags.per_tile_quality;
+        let cur_read_count_mm = read_count;
+        let cur_qvl_len_mm = qual_vs_length_mm.len();
         let acc: BatchAccum = batch
             .par_iter()
-            .fold(BatchAccum::default, move |mut acc, range| {
+            .enumerate()
+            .fold(BatchAccum::default, move |mut acc, (bi, range)| {
                 let id   = range.id(mmap_bytes);
                 let seq  = range.seq(mmap_bytes);
                 let qual = range.qual(mmap_bytes);
@@ -816,6 +951,27 @@ fn process_single_file_mmap(
                 };
                 let fp = fingerprint(eff_seq);
                 acc.process(eff_seq, eff_qual, tile_info, fp, adapter_name.is_some());
+                // Long-read ONT data (mmap path)
+                if is_lr_mm {
+                    if let Some(ch) = parse_ont_channel(id) {
+                        *acc.ont_channel_counts.entry(ch).or_insert(0) += 1;
+                    }
+                    if let Some(ts) = parse_ont_start_time(id) {
+                        acc.reads_over_time_raw.push((ts, 1));
+                    }
+                    let global_idx = cur_read_count_mm + bi as u64;
+                    let already = cur_qvl_len_mm + acc.qual_vs_length.len();
+                    let sample_n: u64 = if already < MAX_QUAL_VS_LEN_POINTS { 50 } else { u64::MAX };
+                    if sample_n < u64::MAX && global_idx.is_multiple_of(sample_n) {
+                        if let Some(q) = eff_qual {
+                            if !q.is_empty() {
+                                let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                                let mean_q = phred_sum as f32 / q.len() as f32;
+                                acc.qual_vs_length.push((eff_seq.len() as u32, mean_q));
+                            }
+                        }
+                    }
+                }
                 acc
             })
             .reduce(BatchAccum::default, BatchAccum::merge);
@@ -876,6 +1032,17 @@ fn process_single_file_mmap(
         );
         reads_filtered += acc.reads_filtered;
 
+        // Merge long-read data from batch accum (mmap path)
+        for (ch, cnt) in acc.ont_channel_counts {
+            *ont_channel_counts_mm.entry(ch).or_insert(0) += cnt;
+        }
+        if qual_vs_length_mm.len() < MAX_QUAL_VS_LEN_POINTS {
+            let remaining = MAX_QUAL_VS_LEN_POINTS - qual_vs_length_mm.len();
+            let take = acc.qual_vs_length.len().min(remaining);
+            qual_vs_length_mm.extend_from_slice(&acc.qual_vs_length[..take]);
+        }
+        reads_over_time_raw_mm.extend(acc.reads_over_time_raw);
+
         // GC per-read distribution (reuses already-computed per-batch data)
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
             *dst += src;
@@ -922,6 +1089,10 @@ fn process_single_file_mmap(
     producer.join().expect("reader thread panicked");
     drop(trim_writer);
 
+    // Finalize long-read mode (mmap path)
+    let is_long_read_final_mm = config.is_long_read || long_read_detected_mm || ont_header_detected_mm;
+    let final_reads_over_time_mm = bucket_reads_over_time(reads_over_time_raw_mm);
+
     let dup_rate = if config.flags.duplication_check && read_count > 0 {
         let unique_est = hll.len() as u64;
         read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
@@ -958,6 +1129,10 @@ fn process_single_file_mmap(
         cur.overrepresented_sequences = overrep_seqs;
         cur.gc_distribution = gc_distribution.to_vec();
         cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
+        cur.long_read_mode = is_long_read_final_mm;
+        cur.ont_channel_counts = ont_channel_counts_mm;
+        cur.reads_over_time = final_reads_over_time_mm;
+        cur.qual_vs_length = qual_vs_length_mm;
         cur.module_status = compute_module_status(cur);
     }
 
@@ -1000,6 +1175,121 @@ fn parse_illumina_tile(id: &[u8]) -> Option<u32> {
     let s = s.split_ascii_whitespace().next()?;
     let parts: Vec<&str> = s.split(':').collect();
     if parts.len() >= 6 { parts[4].parse().ok() } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// ONT / long-read helpers
+// ---------------------------------------------------------------------------
+
+/// Parse `ch=<N>` from an ONT FASTQ read header.
+/// ONT headers look like:
+///   @<uuid> runid=<id> read=<N> ch=<channel> start_time=2024-01-15T10:30:00Z ...
+/// Matches only when `ch=` is preceded by whitespace or is at the start (space-delimited field).
+fn parse_ont_channel(id: &[u8]) -> Option<u32> {
+    let s = std::str::from_utf8(id).ok()?;
+    // Find " ch=" (space-prefixed) to avoid matching inside other tokens like "arch="
+    let search = " ch=";
+    let idx = s.find(search).map(|i| i + search.len())
+        .or_else(|| s.strip_prefix("ch=").map(|_| 3))?;
+    let after = &s[idx..];
+    let end = after.find(|c: char| !c.is_ascii_digit()).unwrap_or(after.len());
+    if end == 0 { return None; }
+    after[..end].parse().ok()
+}
+
+/// Parse `start_time=<ISO8601>` from an ONT read header and return Unix seconds.
+/// Handles the format: `2024-01-15T10:30:00Z` (UTC, Zulu suffix).
+/// Returns None if the field is absent or unparseable.
+fn parse_ont_start_time(id: &[u8]) -> Option<u64> {
+    let s = std::str::from_utf8(id).ok()?;
+    let idx = s.find("start_time=")?;
+    let after = &s[idx + 11..];
+    // Grab the timestamp token (no whitespace)
+    let end = after.find(|c: char| c.is_ascii_whitespace()).unwrap_or(after.len());
+    let ts = &after[..end];
+    // Expected: YYYY-MM-DDTHH:MM:SS[Z] or YYYY-MM-DDTHH:MM:SS+00:00
+    // Must be at least 19 chars: 2024-01-15T10:30:00
+    if ts.len() < 19 { return None; }
+    let year:  u64 = ts[0..4].parse().ok()?;
+    let month: u64 = ts[5..7].parse().ok()?;
+    let day:   u64 = ts[8..10].parse().ok()?;
+    let hour:  u64 = ts[11..13].parse().ok()?;
+    let min:   u64 = ts[14..16].parse().ok()?;
+    let sec:   u64 = ts[17..19].parse().ok()?;
+    // Validate ranges
+    if month == 0 || month > 12 || day == 0 || day > 31 { return None; }
+    if hour > 23 || min > 59 || sec > 60 { return None; }
+    // Days from epoch (1970-01-01) to year-month-day using Gregorian calendar.
+    // We use the algorithm: days since epoch = days_since_epoch(Y,M,D).
+    let days = days_since_unix_epoch(year, month, day)?;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Compute number of days from 1970-01-01 to Y-M-D (proleptic Gregorian calendar).
+/// Returns None for implausible dates.
+fn days_since_unix_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
+    if year < 1970 { return None; }
+    // Days per month (non-leap)
+    const DAYS_IN_MONTH: [u64; 13] = [0, 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+    let days_in_feb = |y: u64| if is_leap(y) { 29u64 } else { 28u64 };
+
+    // Days from 1970 to beginning of `year`
+    let mut total_days: u64 = 0;
+    for y in 1970..year {
+        total_days += if is_leap(y) { 366 } else { 365 };
+    }
+    // Add days for completed months in the current year
+    for m in 1..month {
+        total_days += if m == 2 { days_in_feb(year) } else { DAYS_IN_MONTH[m as usize] };
+    }
+    // Add days in the current month (day 1 = 0 extra days)
+    total_days += day.checked_sub(1)?;
+    Some(total_days)
+}
+
+/// Returns true when the header looks like an ONT read (contains ` ch=` AND `start_time=`).
+fn is_ont_header(id: &[u8]) -> bool {
+    let Ok(s) = std::str::from_utf8(id) else { return false; };
+    (s.contains(" ch=") || s.starts_with("ch=")) && s.contains("start_time=")
+}
+
+/// Compute median read length from a sample of up to `n` lengths.
+/// Returns 0 if the sample is empty.
+fn median_length(lengths: &[u64]) -> u64 {
+    if lengths.is_empty() { return 0; }
+    let mut v = lengths.to_vec();
+    v.sort_unstable();
+    let mid = v.len() / 2;
+    if v.len().is_multiple_of(2) {
+        (v[mid - 1] + v[mid]) / 2
+    } else {
+        v[mid]
+    }
+}
+
+/// Bucket raw (timestamp_secs, 1) events into 5-minute cumulative intervals.
+/// Returns vec of (minutes_since_start, cumulative_reads).
+fn bucket_reads_over_time(mut raw: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    if raw.is_empty() { return Vec::new(); }
+    raw.sort_unstable_by_key(|&(ts, _)| ts);
+    let t0 = raw[0].0;
+    const BUCKET_SECS: u64 = 300; // 5 minutes
+    let last_ts = raw.last().unwrap().0;
+    let n_buckets = ((last_ts - t0) / BUCKET_SECS + 1) as usize;
+    let mut buckets = vec![0u64; n_buckets];
+    for (ts, _) in &raw {
+        let b = ((ts - t0) / BUCKET_SECS) as usize;
+        buckets[b.min(n_buckets - 1)] += 1;
+    }
+    // Convert to cumulative
+    let mut result = Vec::with_capacity(n_buckets);
+    let mut cumulative = 0u64;
+    for (i, &count) in buckets.iter().enumerate() {
+        cumulative += count;
+        result.push(((i as u64) * 5, cumulative));
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
