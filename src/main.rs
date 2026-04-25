@@ -57,6 +57,9 @@ OUTPUT OPTIONS:
   --long-read         Force long-read mode (ONT / PacBio). Auto-detected when
                       read headers contain ch= + start_time= (ONT) or when
                       median read length of first 1000 reads exceeds 1000 bp.
+  --compare           After processing two input files, write a side-by-side
+                      comparison.html report in the output directory.
+                      Usage: biofastq-a sample1.fastq sample2.fastq --compare
   --no-html           Skip HTML report generation
   --no-json           Skip JSON report generation
   --multiqc           Write a MultiQC-compatible <stem>_mqc.json file
@@ -131,6 +134,8 @@ struct CliConfig {
     trim_tail: u16,
     min_quality: u8,
     max_n: Option<u32>,
+    // Comparison report
+    compare: bool,
 }
 
 fn parse_args() -> Result<CliConfig, String> {
@@ -179,6 +184,7 @@ fn parse_args() -> Result<CliConfig, String> {
     let mut trim_tail: u16 = 0;
     let mut min_quality: u8 = 0;
     let mut max_n: Option<u32> = None;
+    let mut compare = false;
     let mut i = 0;
 
     while i < args.len() {
@@ -285,6 +291,7 @@ fn parse_args() -> Result<CliConfig, String> {
             "--fast" => fast = true,
             "--multiqc" => multiqc = true,
             "--long-read" => long_read = true,
+            "--compare" => compare = true,
             "--in2" => {
                 i += 1;
                 if i >= args.len() {
@@ -351,6 +358,7 @@ fn parse_args() -> Result<CliConfig, String> {
         trim_tail,
         min_quality,
         max_n,
+        compare,
     })
 }
 
@@ -488,6 +496,8 @@ fn main() {
     process_config.min_avg_quality  = cfg.min_quality;
     process_config.max_n_bases      = cfg.max_n;
     process_config.is_long_read     = cfg.long_read;
+    // Note: process_config.compare (old pre-pass mode) is intentionally not set here.
+    // The --compare flag now generates a post-processing two-file comparison report.
 
     let n_files = cfg.input_files.len();
     let state = Arc::new(Mutex::new(SharedState::new(n_files)));
@@ -555,6 +565,19 @@ fn main() {
             println!("\nAnalysis complete!\n");
             for f in snap.all_files() {
                 print_file_summary(f);
+                // Auto-parameter suggestions
+                let suggestions = report::suggest_parameters(f);
+                if !suggestions.is_empty() {
+                    let fname = std::path::Path::new(&f.file_path)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or(&f.file_path);
+                    println!("  Suggested parameters for {}:", fname);
+                    for s in &suggestions {
+                        println!("    {}", s);
+                    }
+                    println!();
+                }
             }
             if report_flags.html_report {
                 match report::export_html(&snap, &cfg.output_dir, &report_flags) {
@@ -572,6 +595,20 @@ fn main() {
                 match report::export_multiqc(&snap, &cfg.output_dir) {
                     Ok(path) => println!("MultiQC data: {}", path),
                     Err(e) => eprintln!("Warning: MultiQC export failed: {}", e),
+                }
+            }
+            if cfg.compare {
+                let n_processed = snap.all_files().len();
+                if n_processed < 2 {
+                    eprintln!("Warning: --compare requires at least two input files. Skipping comparison report.");
+                } else {
+                    if n_processed > 2 {
+                        eprintln!("Warning: --compare only compares the first two files. {} additional file(s) ignored.", n_processed - 2);
+                    }
+                    match report::export_comparison_html(&snap, &cfg.output_dir) {
+                        Ok(path) => println!("Comparison:   {}", path),
+                        Err(e) => eprintln!("Warning: Comparison report failed: {}", e),
+                    }
                 }
             }
             let elapsed = snap.elapsed_secs();

@@ -1728,3 +1728,300 @@ fn report_stem(files: &[&FileStats]) -> String {
         "batch_report".to_string()
     }
 }
+
+// ---------------------------------------------------------------------------
+// Auto-parameter suggestions
+// ---------------------------------------------------------------------------
+
+pub fn suggest_parameters(f: &FileStats) -> Vec<String> {
+    let mut suggestions = Vec::new();
+
+    // Poly-G: high G% at 3' end positions relative to overall GC
+    let n_pos = f.base_composition.len();
+    if n_pos >= 10 {
+        let last10_g: f64 = f.base_composition[n_pos.saturating_sub(10)..]
+            .iter()
+            .map(|b| {
+                let total = (b[0] + b[1] + b[2] + b[3] + b[4]) as f64;
+                if total > 0.0 { b[2] as f64 / total } else { 0.0 }
+            })
+            .sum::<f64>() / 10.0;
+        if last10_g > 0.40 && f.gc_content() < 65.0 {
+            suggestions.push(format!(
+                "--poly-g 10  (high G% at 3' end [{:.0}%], typical of NovaSeq/NextSeq 2-color chemistry)",
+                last10_g * 100.0
+            ));
+        }
+    }
+
+    // Adapter contamination
+    let ap = f.adapter_pct();
+    if ap > 20.0 {
+        suggestions.push(format!(
+            "--trim  (HIGH adapter content [{:.1}%] — strongly recommended)",
+            ap
+        ));
+    } else if ap > 5.0 {
+        suggestions.push(format!(
+            "--trim  (adapter sequences detected in {:.1}% of reads)",
+            ap
+        ));
+    }
+
+    // 3' quality drop: find position where mean quality first falls below Q20
+    let qual_means = f.avg_qual_per_position();
+    let drop_pos = qual_means.iter().enumerate()
+        .find(|(_, &q)| q > 0.0 && q < 20.0)
+        .map(|(i, _)| i);
+
+    if let Some(pos) = drop_pos {
+        let pct = pos as f64 / qual_means.len().max(1) as f64;
+        if pct < 0.90 {
+            suggestions.push(format!(
+                "--cut-right --window-quality 20  (mean quality drops below Q20 at position {})",
+                pos
+            ));
+        }
+    }
+
+    // Low overall quality
+    let aq = f.avg_quality();
+    if aq < 25.0 && aq > 0.0 {
+        suggestions.push(format!(
+            "--min-quality 20  (mean read quality Q{:.1} is below typical threshold)",
+            aq
+        ));
+    }
+
+    // High N content
+    let high_n = f.n_content_per_position().iter().any(|&n| n > 5.0);
+    if high_n {
+        suggestions.push("--max-n 5  (elevated N base content detected)".to_string());
+    }
+
+    // High duplication
+    if f.dup_rate_pct > 50.0 {
+        suggestions.push(format!(
+            "High duplication rate ({:.1}%) — consider deduplication downstream",
+            f.dup_rate_pct
+        ));
+    }
+
+    suggestions
+}
+
+// ---------------------------------------------------------------------------
+// Two-file comparison report
+// ---------------------------------------------------------------------------
+
+pub fn export_comparison_html(snap: &SharedState, output_dir: &str) -> Result<String, String> {
+    let files = snap.all_files();
+    if files.len() < 2 {
+        return Err("Need at least two files for comparison".to_string());
+    }
+    let f1 = files[0];
+    let f2 = files[1];
+
+    let fname1 = Path::new(&f1.file_path).file_name()
+        .and_then(|n| n.to_str()).unwrap_or(&f1.file_path);
+    let fname2 = Path::new(&f2.file_path).file_name()
+        .and_then(|n| n.to_str()).unwrap_or(&f2.file_path);
+
+    let long_read = f1.long_read_mode || f2.long_read_mode;
+    let (q_lo, q_hi) = if long_read { (10u8, 20u8) } else { (20u8, 30u8) };
+
+    let mixed_note = if f1.long_read_mode != f2.long_read_mode {
+        "<p style='color:#b45309;background:#fffbeb;padding:8px;border-radius:6px;margin:12px 0'>\
+        ⚠ Note: comparing short-read and long-read files — thresholds may differ.</p>"
+    } else { "" };
+
+    fn pct_delta(a: f64, b: f64) -> String {
+        let d = b - a;
+        if d.abs() < 0.01 { "±0".to_string() }
+        else if d > 0.0 { format!("+{:.2}", d) }
+        else { format!("{:.2}", d) }
+    }
+    fn fmt_delta(a: f64, b: f64, unit: &str) -> String {
+        let d = b - a;
+        let sign = if d >= 0.0 { "+" } else { "" };
+        format!("{}{:.1}{}", sign, d, unit)
+    }
+
+    let (n50_1, _n90_1) = f1.compute_n50_n90();
+    let (n50_2, _n90_2) = f2.compute_n50_n90();
+
+    let rows = vec![
+        ("Reads", format_number(f1.read_count), format_number(f2.read_count),
+         fmt_delta(f1.read_count as f64, f2.read_count as f64, "")),
+        ("Total Bases", format_bases(f1.total_bases), format_bases(f2.total_bases),
+         fmt_delta(f1.total_bases as f64, f2.total_bases as f64, " bp")),
+        ("Avg Length", format!("{:.1} bp", f1.avg_length()), format!("{:.1} bp", f2.avg_length()),
+         fmt_delta(f1.avg_length(), f2.avg_length(), " bp")),
+        ("GC Content", format!("{:.2}%", f1.gc_content()), format!("{:.2}%", f2.gc_content()),
+         pct_delta(f1.gc_content(), f2.gc_content()) + "%"),
+        ("Avg Quality", format!("Q{:.1}", f1.avg_quality()), format!("Q{:.1}", f2.avg_quality()),
+         fmt_delta(f1.avg_quality(), f2.avg_quality(), "")),
+        (if q_lo == 10 { "≥Q10" } else { "≥Q20" },
+         format!("{:.1}%", f1.q20_pct()),
+         format!("{:.1}%", f2.q20_pct()),
+         pct_delta(f1.q20_pct(), f2.q20_pct()) + "%"),
+        (if q_hi == 20 { "≥Q20" } else { "≥Q30" },
+         format!("{:.1}%", if q_hi == 20 { f1.q20_pct() } else { f1.q30_pct() }),
+         format!("{:.1}%", if q_hi == 20 { f2.q20_pct() } else { f2.q30_pct() }),
+         pct_delta(f1.q30_pct(), f2.q30_pct()) + "%"),
+        ("Adapter %", format!("{:.2}%", f1.adapter_pct()), format!("{:.2}%", f2.adapter_pct()),
+         pct_delta(f1.adapter_pct(), f2.adapter_pct()) + "%"),
+        ("Dup Rate", format!("{:.1}%", f1.dup_rate_pct), format!("{:.1}%", f2.dup_rate_pct),
+         pct_delta(f1.dup_rate_pct, f2.dup_rate_pct) + "%"),
+        ("N50", n50_1.to_string(), n50_2.to_string(),
+         fmt_delta(n50_1 as f64, n50_2 as f64, " bp")),
+    ];
+
+    let mut table_rows = String::new();
+    for (label, v1, v2, delta) in &rows {
+        table_rows.push_str(&format!(
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td style='color:#6b7280'>{}</td></tr>",
+            label, v1, v2, delta
+        ));
+    }
+
+    // Serialize qual per position for JS
+    let serialize_qual = |means: &[f64]| -> String {
+        format!("[{}]", means.iter().map(|v| format!("{:.2}", v)).collect::<Vec<_>>().join(","))
+    };
+
+    let qual1_js = serialize_qual(&f1.avg_qual_per_position());
+    let qual2_js = serialize_qual(&f2.avg_qual_per_position());
+
+    // Length histogram: convert HashMap to sorted Vec for JS
+    let serialize_len = |hist: &std::collections::HashMap<u64, u64>| -> String {
+        if hist.is_empty() { return "[]".to_string(); }
+        let max_len = *hist.keys().max().unwrap_or(&0);
+        let mut arr = vec![0u64; (max_len as usize).min(10_000) + 1];
+        for (&len, &cnt) in hist {
+            if (len as usize) < arr.len() { arr[len as usize] = cnt; }
+        }
+        format!("[{}]", arr.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(","))
+    };
+
+    let len_dist1_js = serialize_len(&f1.length_histogram);
+    let len_dist2_js = serialize_len(&f2.length_histogram);
+
+    let html = format!(r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BioFastq-A Comparison Report</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f8fafc;color:#1e293b;margin:0;padding:0}}
+header{{background:#1a5fa8;color:#fff;padding:18px 32px;display:flex;align-items:center;justify-content:space-between}}
+header h1{{margin:0;font-size:1.3rem;font-weight:700}}
+header span{{font-size:.85rem;opacity:.8}}
+.container{{max-width:1100px;margin:32px auto;padding:0 24px}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:32px}}
+th{{background:#f1f5f9;padding:10px 16px;text-align:left;font-size:.8rem;text-transform:uppercase;color:#64748b;letter-spacing:.05em}}
+td{{padding:10px 16px;border-top:1px solid #f1f5f9;font-size:.9rem}}
+tr:hover td{{background:#f8fafc}}
+.chart-grid{{display:grid;grid-template-columns:1fr 1fr;gap:24px;margin-bottom:32px}}
+.card{{background:#fff;border-radius:10px;box-shadow:0 1px 4px rgba(0,0,0,.08);padding:20px}}
+.card h3{{margin:0 0 12px;font-size:.95rem;color:#1e293b}}
+canvas{{width:100%!important}}
+.legend{{display:flex;gap:16px;font-size:.8rem;margin-bottom:8px}}
+.legend-dot{{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:4px}}
+</style>
+</head>
+<body>
+<header>
+  <h1>BioFastq-A — Comparison Report</h1>
+  <span>biofastq-a v{ver}</span>
+</header>
+<div class="container">
+  {mixed}
+  <table>
+    <thead><tr><th>Metric</th><th>{f1}</th><th>{f2}</th><th>Delta (f2−f1)</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+  <div class="chart-grid">
+    <div class="card">
+      <h3>Quality per Position</h3>
+      <div class="legend">
+        <span><span class="legend-dot" style="background:#1a5fa8"></span>{f1}</span>
+        <span><span class="legend-dot" style="background:#f59e0b"></span>{f2}</span>
+      </div>
+      <canvas id="qualChart" height="180"></canvas>
+    </div>
+    <div class="card">
+      <h3>Read Length Distribution</h3>
+      <div class="legend">
+        <span><span class="legend-dot" style="background:#1a5fa8"></span>{f1}</span>
+        <span><span class="legend-dot" style="background:#f59e0b"></span>{f2}</span>
+      </div>
+      <canvas id="lenChart" height="180"></canvas>
+    </div>
+  </div>
+</div>
+<script>
+const qual1={q1}, qual2={q2};
+const len1={l1}, len2={l2};
+
+function drawOverlay(id, data1, data2, label1, label2, yLabel) {{
+  const cv = document.getElementById(id);
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  cv.width = cv.parentElement.clientWidth || 500;
+  cv.height = 200;
+  const W=cv.width, H=cv.height, pad={{t:20,r:20,b:40,l:50}};
+  const iW=W-pad.l-pad.r, iH=H-pad.t-pad.b;
+  ctx.clearRect(0,0,W,H);
+  const all=[...data1,...data2].filter(v=>v>0);
+  if(!all.length) return;
+  const maxV=Math.max(...all);
+  const len=Math.max(data1.length,data2.length);
+  function drawLine(data, color) {{
+    ctx.beginPath(); ctx.strokeStyle=color; ctx.lineWidth=2;
+    data.forEach((v,i)=>{{
+      const x=pad.l+i/Math.max(len-1,1)*iW;
+      const y=pad.t+iH-(v/maxV)*iH;
+      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    }});
+    ctx.stroke();
+  }}
+  drawLine(data1,'#1a5fa8');
+  drawLine(data2,'#f59e0b');
+  // axes
+  ctx.strokeStyle='#e2e8f0'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(pad.l,pad.t); ctx.lineTo(pad.l,pad.t+iH); ctx.lineTo(pad.l+iW,pad.t+iH); ctx.stroke();
+  ctx.fillStyle='#64748b'; ctx.font='11px sans-serif'; ctx.textAlign='center';
+  [0,Math.floor(len/4),Math.floor(len/2),Math.floor(3*len/4),len-1].forEach(i=>{{
+    const x=pad.l+i/Math.max(len-1,1)*iW;
+    ctx.fillText(i,x,H-8);
+  }});
+}}
+
+window.addEventListener('load',()=>{{
+  drawOverlay('qualChart',qual1,qual2,'{f1}','{f2}','Mean Phred');
+  drawOverlay('lenChart',len1,len2,'{f1}','{f2}','Reads');
+}});
+</script>
+</body>
+</html>"#,
+        ver = env!("CARGO_PKG_VERSION"),
+        mixed = mixed_note,
+        f1 = escape_html(fname1),
+        f2 = escape_html(fname2),
+        rows = table_rows,
+        q1 = qual1_js,
+        q2 = qual2_js,
+        l1 = len_dist1_js,
+        l2 = len_dist2_js,
+    );
+
+    let stem = format!("{}_vs_{}",
+        Path::new(&f1.file_path).file_stem().and_then(|s| s.to_str()).unwrap_or("file1"),
+        Path::new(&f2.file_path).file_stem().and_then(|s| s.to_str()).unwrap_or("file2"),
+    );
+    let out_path = format!("{}/{}_comparison.html", output_dir.trim_end_matches('/'), stem);
+    fs::write(&out_path, html).map_err(|e| e.to_string())?;
+    Ok(out_path)
+}

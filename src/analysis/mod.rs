@@ -359,11 +359,392 @@ pub fn process_files(paths: Vec<String>, state: Arc<Mutex<SharedState>>, config:
 }
 
 // ---------------------------------------------------------------------------
+// Raw-stats-only pre-pass (used for --compare mode)
+// ---------------------------------------------------------------------------
+
+/// Build a ProcessConfig with all trimming and filtering disabled.
+/// Used to collect pure raw stats in --compare mode.
+fn make_raw_config(config: &ProcessConfig) -> ProcessConfig {
+    ProcessConfig {
+        trim_output: false,
+        poly_g_min_len: 0,
+        poly_x_min_len: 0,
+        cut_right_window: 0,
+        cut_right_qual: 20,
+        cut_front_window: 0,
+        cut_front_qual: 20,
+        cut_tail_window: 0,
+        cut_tail_qual: 20,
+        trim_front_bases: 0,
+        trim_tail_bases: 0,
+        min_avg_quality: 0,
+        max_n_bases: None,
+        quality_trim_threshold: 0,
+        compare: false,
+        min_length: 0,
+        ..config.clone()
+    }
+}
+
+/// Collect raw (pre-trim) FileStats for a single file using a no-trim config.
+/// Returns None on I/O error (errors are already logged via state).
+fn collect_raw_stats(
+    file_path: &str,
+    state: &Arc<Mutex<SharedState>>,
+    config: &ProcessConfig,
+) -> Option<FileStats> {
+    let raw_config = make_raw_config(config);
+    let file_size = std::fs::metadata(file_path).map(|m| m.len()).unwrap_or(0);
+
+    let is_plain_fastq = !file_path.ends_with(".gz")
+        && !file_path.ends_with(".fasta")
+        && !file_path.ends_with(".fa");
+
+    if is_plain_fastq {
+        collect_raw_stats_mmap(file_path, state, &raw_config, file_size)
+    } else {
+        collect_raw_stats_needletail(file_path, state, &raw_config, file_size)
+    }
+}
+
+fn collect_raw_stats_needletail(
+    file_path: &str,
+    state: &Arc<Mutex<SharedState>>,
+    config: &ProcessConfig,
+    file_size: u64,
+) -> Option<FileStats> {
+    let mut reader = match parse_fastx_file(file_path) {
+        Ok(r) => r,
+        Err(e) => {
+            state.lock().unwrap().log(LogLevel::Warning,
+                format!("compare pre-pass: cannot open {}: {}", file_path, e));
+            return None;
+        }
+    };
+
+    let mut read_count = 0u64;
+    let mut total_bases = 0u64;
+    let mut gc_count = 0u64;
+    let mut quality_sum = 0u64;
+    let mut quality_bases = 0u64;
+    let mut q20_bases = 0u64;
+    let mut q30_bases = 0u64;
+    let mut adapter_hits = 0u64;
+    let mut min_length = u64::MAX;
+    let mut max_length = 0u64;
+    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
+    let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
+    let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
+    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut hll: HyperLogLog = HyperLogLog::new(0.01);
+    let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
+    let mut overrep_sampled = 0usize;
+    let mut gc_distribution = [0u64; 101];
+    let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
+    let mut dup_sample_count = 0usize;
+
+    loop {
+        let mut batch: Vec<OwnedRecord> = Vec::with_capacity(PARALLEL_BATCH);
+        while batch.len() < PARALLEL_BATCH {
+            match reader.next() {
+                None => break,
+                Some(Err(_)) => continue,
+                Some(Ok(record)) => {
+                    let id = record.id().to_vec();
+                    let seq = record.normalize(false).to_vec();
+                    let qual = record.qual().map(|q| q.to_vec());
+                    batch.push(OwnedRecord { id, seq, qual });
+                }
+            }
+        }
+        if batch.is_empty() { break; }
+
+        let cfg = config;
+        let per_tile_enabled = cfg.flags.per_tile_quality;
+        let acc: BatchAccum = batch
+            .par_iter()
+            .fold(BatchAccum::default, move |mut acc, rec| {
+                let Some((effective_seq, effective_qual, adapter_name)) =
+                    trim_record(&rec.seq, rec.qual.as_deref(), cfg)
+                else {
+                    return acc;
+                };
+                let tile_info = if per_tile_enabled {
+                    parse_illumina_tile(&rec.id).and_then(|tile_id| {
+                        effective_qual.map(|q| {
+                            let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                            (tile_id, phred_sum, q.len() as u64)
+                        })
+                    })
+                } else { None };
+                let fp = metrics::fingerprint(effective_seq);
+                acc.process(effective_seq, effective_qual, tile_info, fp, adapter_name.is_some());
+                acc
+            })
+            .reduce(BatchAccum::default, BatchAccum::merge);
+
+        if config.flags.duplication_check {
+            for &fp in &acc.fingerprints { hll.insert(&fp); }
+        }
+        if !acc.kmer_seqs.is_empty() {
+            if config.flags.overrep_sequences {
+                for seq in &acc.kmer_seqs {
+                    if overrep_sampled < OVERREP_SAMPLE {
+                        let mut key = [0u8; 50];
+                        let n = seq.len().min(50);
+                        key[..n].copy_from_slice(&seq[..n]);
+                        *overrep_map.entry(key).or_insert(0) += 1;
+                        overrep_sampled += 1;
+                    }
+                }
+            }
+            if config.flags.kmer_analysis {
+                let kmers = count_kmers_parallel(&acc.kmer_seqs);
+                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            }
+        }
+        merge_batch_into_totals(
+            &acc,
+            &mut read_count, &mut total_bases, &mut gc_count,
+            &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
+            &mut adapter_hits, &mut min_length, &mut max_length,
+            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut base_composition, &mut quality_distribution, &mut per_tile,
+            &mut quality_by_length_bin,
+        );
+        for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
+            *dst += src;
+        }
+        if config.flags.duplication_check && dup_sample_count < OVERREP_SAMPLE {
+            for &fp in &acc.fingerprints {
+                if dup_sample_count >= OVERREP_SAMPLE { break; }
+                *dup_sample.entry(fp).or_insert(0) += 1;
+                dup_sample_count += 1;
+            }
+        }
+    }
+
+    let dup_rate = if config.flags.duplication_check && read_count > 0 {
+        let unique_est = hll.len() as u64;
+        read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
+    } else { 0.0 };
+    let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
+
+    let mut raw = crate::types::FileStats::new(file_path.to_string(), file_size);
+    raw.read_count            = read_count;
+    raw.total_bases           = total_bases;
+    raw.gc_count              = gc_count;
+    raw.quality_sum           = quality_sum;
+    raw.quality_bases         = quality_bases;
+    raw.q20_bases             = q20_bases;
+    raw.q30_bases             = q30_bases;
+    raw.adapter_hits          = adapter_hits;
+    raw.min_length            = min_length;
+    raw.max_length            = max_length;
+    raw.bytes_processed       = file_size;
+    raw.length_histogram      = length_histogram;
+    raw.quality_by_position   = quality_by_pos;
+    raw.qual_hist_by_position = qual_hist_by_pos;
+    raw.kmer_counts           = kmer_total;
+    raw.dup_rate_pct          = dup_rate;
+    raw.per_tile_quality      = per_tile;
+    raw.base_composition      = base_composition;
+    raw.quality_distribution  = quality_distribution;
+    raw.quality_by_length_bin = quality_by_length_bin;
+    raw.overrepresented_sequences = overrep_seqs;
+    raw.gc_distribution       = gc_distribution.to_vec();
+    raw.dup_level_histogram   = compute_dup_histogram(&dup_sample);
+    raw.module_status         = compute_module_status(&raw);
+    Some(raw)
+}
+
+fn collect_raw_stats_mmap(
+    file_path: &str,
+    state: &Arc<Mutex<SharedState>>,
+    config: &ProcessConfig,
+    file_size: u64,
+) -> Option<FileStats> {
+    let mut mmap_reader = match mmap_reader::MmapFastq::open(file_path) {
+        Ok(r) => r,
+        Err(e) => {
+            state.lock().unwrap().log(LogLevel::Warning,
+                format!("compare pre-pass: cannot open {}: {}", file_path, e));
+            return None;
+        }
+    };
+
+    let mut read_count = 0u64;
+    let mut total_bases = 0u64;
+    let mut gc_count = 0u64;
+    let mut quality_sum = 0u64;
+    let mut quality_bases = 0u64;
+    let mut q20_bases = 0u64;
+    let mut q30_bases = 0u64;
+    let mut adapter_hits = 0u64;
+    let mut min_length = u64::MAX;
+    let mut max_length = 0u64;
+    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
+    let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
+    let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
+    let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
+    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut hll: HyperLogLog = HyperLogLog::new(0.01);
+    let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
+    let mut overrep_sampled = 0usize;
+    let mut gc_distribution = [0u64; 101];
+    let mut dup_sample: HashMap<u64, u32> = HashMap::with_capacity(8192);
+    let mut dup_sample_count = 0usize;
+
+    let mmap_arc = mmap_reader.mmap_arc();
+    let (tx, rx) = crossbeam_channel::bounded::<(Vec<mmap_reader::RecordRange>, u64)>(8);
+
+    let producer = thread::spawn(move || {
+        loop {
+            let mut batch: Vec<mmap_reader::RecordRange> = Vec::with_capacity(PARALLEL_BATCH);
+            let mut batch_bytes = 0u64;
+            while batch.len() < PARALLEL_BATCH {
+                match mmap_reader.next_range() {
+                    None => break,
+                    Some(range) => {
+                        batch_bytes += range.id_len as u64 + range.seq_len as u64
+                            + range.qual_len as u64 + 6;
+                        batch.push(range);
+                    }
+                }
+            }
+            if batch.is_empty() { break; }
+            if tx.send((batch, batch_bytes)).is_err() { break; }
+        }
+    });
+
+    let mmap_bytes: &[u8] = &mmap_arc;
+
+    while let Ok((batch, _batch_bytes)) = rx.recv() {
+        let per_tile_enabled = config.flags.per_tile_quality;
+        let acc: BatchAccum = batch
+            .par_iter()
+            .fold(BatchAccum::default, move |mut acc, range| {
+                let id   = range.id(mmap_bytes);
+                let seq  = range.seq(mmap_bytes);
+                let qual = range.qual(mmap_bytes);
+                let Some((eff_seq, eff_qual, adapter_name)) =
+                    trim_record(seq, Some(qual), config)
+                else {
+                    return acc;
+                };
+                let tile_info = if per_tile_enabled {
+                    parse_illumina_tile(id).and_then(|tile_id| {
+                        eff_qual.map(|q| {
+                            let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
+                            (tile_id, phred_sum, q.len() as u64)
+                        })
+                    })
+                } else { None };
+                let fp = metrics::fingerprint(eff_seq);
+                acc.process(eff_seq, eff_qual, tile_info, fp, adapter_name.is_some());
+                acc
+            })
+            .reduce(BatchAccum::default, BatchAccum::merge);
+
+        if config.flags.duplication_check {
+            for &fp in &acc.fingerprints { hll.insert(&fp); }
+        }
+        if !acc.kmer_seqs.is_empty() {
+            if config.flags.overrep_sequences {
+                for seq in &acc.kmer_seqs {
+                    if overrep_sampled < OVERREP_SAMPLE {
+                        let mut key = [0u8; 50];
+                        let n = seq.len().min(50);
+                        key[..n].copy_from_slice(&seq[..n]);
+                        *overrep_map.entry(key).or_insert(0) += 1;
+                        overrep_sampled += 1;
+                    }
+                }
+            }
+            if config.flags.kmer_analysis {
+                let kmers = count_kmers_parallel(&acc.kmer_seqs);
+                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+            }
+        }
+        merge_batch_into_totals(
+            &acc,
+            &mut read_count, &mut total_bases, &mut gc_count,
+            &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
+            &mut adapter_hits, &mut min_length, &mut max_length,
+            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut base_composition, &mut quality_distribution, &mut per_tile,
+            &mut quality_by_length_bin,
+        );
+        for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
+            *dst += src;
+        }
+        if config.flags.duplication_check && dup_sample_count < OVERREP_SAMPLE {
+            for &fp in &acc.fingerprints {
+                if dup_sample_count >= OVERREP_SAMPLE { break; }
+                *dup_sample.entry(fp).or_insert(0) += 1;
+                dup_sample_count += 1;
+            }
+        }
+    }
+
+    producer.join().expect("compare pre-pass reader thread panicked");
+
+    let dup_rate = if config.flags.duplication_check && read_count > 0 {
+        let unique_est = hll.len() as u64;
+        read_count.saturating_sub(unique_est) as f64 / read_count as f64 * 100.0
+    } else { 0.0 };
+    let overrep_seqs = finish_overrep(overrep_map, overrep_sampled);
+
+    let mut raw = crate::types::FileStats::new(file_path.to_string(), file_size);
+    raw.read_count            = read_count;
+    raw.total_bases           = total_bases;
+    raw.gc_count              = gc_count;
+    raw.quality_sum           = quality_sum;
+    raw.quality_bases         = quality_bases;
+    raw.q20_bases             = q20_bases;
+    raw.q30_bases             = q30_bases;
+    raw.adapter_hits          = adapter_hits;
+    raw.min_length            = min_length;
+    raw.max_length            = max_length;
+    raw.bytes_processed       = file_size;
+    raw.length_histogram      = length_histogram;
+    raw.quality_by_position   = quality_by_pos;
+    raw.qual_hist_by_position = qual_hist_by_pos;
+    raw.kmer_counts           = kmer_total;
+    raw.dup_rate_pct          = dup_rate;
+    raw.per_tile_quality      = per_tile;
+    raw.base_composition      = base_composition;
+    raw.quality_distribution  = quality_distribution;
+    raw.quality_by_length_bin = quality_by_length_bin;
+    raw.overrepresented_sequences = overrep_seqs;
+    raw.gc_distribution       = gc_distribution.to_vec();
+    raw.dup_level_histogram   = compute_dup_histogram(&dup_sample);
+    raw.module_status         = compute_module_status(&raw);
+    Some(raw)
+}
+
+// ---------------------------------------------------------------------------
 // Per-file processing — parallel batch model
 // ---------------------------------------------------------------------------
 
 fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config: &ProcessConfig) {
     let file_size = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
+
+    // --compare pre-pass: collect raw stats before trimming
+    let raw_stats_for_compare: Option<FileStats> = if config.compare && config.trim_output {
+        state.lock().unwrap().log(LogLevel::Info,
+            format!("compare: collecting raw stats for {}", file_path));
+        collect_raw_stats(&file_path, &state, config)
+    } else {
+        None
+    };
 
     let trim_path = config.trim_output.then(|| {
         format!("{}/{}_trimmed.fastq.gz", config.output_dir, output_stem(&file_path))
@@ -394,7 +775,14 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         && !file_path.ends_with(".fa");
 
     if is_plain_fastq {
-        process_single_file_mmap(file_path, state, config, trim_path, file_size);
+        process_single_file_mmap(file_path, Arc::clone(&state), config, trim_path, file_size);
+        // Attach comparison (raw) stats to the just-completed file entry
+        if let Some(raw) = raw_stats_for_compare {
+            let mut s = state.lock().unwrap();
+            if let Some(last) = s.completed_files.last_mut() {
+                last.comparison_stats = Some(Box::new(raw));
+            }
+        }
         return;
     }
 
@@ -757,6 +1145,9 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.reads_over_time = final_reads_over_time;
         cur.qual_vs_length = qual_vs_length;
         cur.module_status = compute_module_status(cur);
+        if let Some(raw) = raw_stats_for_compare {
+            cur.comparison_stats = Some(Box::new(raw));
+        }
     }
 
     let elapsed = s.elapsed_secs();

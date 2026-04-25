@@ -174,6 +174,9 @@ pub struct ProcessConfig {
     /// Reserved for future ONT-specific processing; currently informational.
     #[allow(dead_code)]
     pub is_ont: bool,
+    /// When true and trim_output is also true, run a pre-pass collecting raw stats
+    /// before trimming so a before/after comparison report can be generated.
+    pub compare: bool,
 }
 
 impl Default for ProcessConfig {
@@ -201,6 +204,7 @@ impl Default for ProcessConfig {
             flags: FeatureFlags::default(),
             is_long_read: false,
             is_ont: false,
+            compare: false,
         }
     }
 }
@@ -270,6 +274,9 @@ pub struct FileStats {
     pub reads_over_time: Vec<(u64, u64)>,
     /// Sampled (read_length, mean_phred_quality) points; max 2000 entries.
     pub qual_vs_length: Vec<(u32, f32)>,
+    /// When comparison mode is active (--compare --trim), this holds the RAW
+    /// (pre-trim) stats; the main FileStats fields hold the post-trim stats.
+    pub comparison_stats: Option<Box<FileStats>>,
 }
 
 impl FileStats {
@@ -310,6 +317,7 @@ impl FileStats {
             ont_channel_counts: HashMap::new(),
             reads_over_time: Vec::new(),
             qual_vs_length: Vec::new(),
+            comparison_stats: None,
         }
     }
 
