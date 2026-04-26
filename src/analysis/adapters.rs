@@ -106,7 +106,7 @@ pub fn sliding_window_cut_tail(qual: &[u8], window_size: usize, threshold: u8) -
         wsum += qual[cut - window_size].saturating_sub(33) as u32;
         if wsum / (window_size as u32) >= (threshold as u32) { return cut; }
     }
-    window_size.saturating_sub(1)
+    0
 }
 
 /// Returns false if the (already trimmed) read fails per-read quality or N filters.

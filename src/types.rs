@@ -384,7 +384,7 @@ impl FileStats {
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
         let n50_thresh = self.total_bases.div_ceil(2);
-        let n90_thresh = self.total_bases * 9 / 10;
+        let n90_thresh = (self.total_bases * 9).div_ceil(10);
 
         let mut cumsum = 0u64;
         let mut n50 = 0u64;
