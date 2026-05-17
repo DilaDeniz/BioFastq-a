@@ -1,8 +1,8 @@
 mod adapters;
 mod io;
-mod kmers;
 mod metrics;
 mod mmap_reader;
+
 
 
 use std::collections::HashMap;
@@ -22,8 +22,7 @@ use crate::types::{
 };
 
 use self::io::{open_writer, write_fastq_record};
-use self::kmers::count_kmers_parallel;
-use self::metrics::{fingerprint, merge_batch_into_totals, BatchAccum};
+use self::metrics::{fingerprint, kmer_table_to_map, merge_batch_into_totals, BatchAccum};
 use self::mmap_reader::RecordRange;
 
 // ---------------------------------------------------------------------------
@@ -436,7 +435,7 @@ fn collect_raw_stats_needletail(
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
-    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -490,21 +489,17 @@ fn collect_raw_stats_needletail(
         if config.flags.duplication_check {
             for &fp in &acc.fingerprints { hll.insert(&fp); }
         }
-        if !acc.kmer_seqs.is_empty() {
-            if config.flags.overrep_sequences {
-                for seq in &acc.kmer_seqs {
-                    if overrep_sampled < OVERREP_SAMPLE {
-                        let mut key = [0u8; 50];
-                        let n = seq.len().min(50);
-                        key[..n].copy_from_slice(&seq[..n]);
-                        *overrep_map.entry(key).or_insert(0) += 1;
-                        overrep_sampled += 1;
-                    }
+        if config.flags.overrep_sequences && !acc.overrep_seqs.is_empty() {
+            for key in &acc.overrep_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(*key).or_insert(0) += 1;
+                    overrep_sampled += 1;
                 }
             }
-            if config.flags.kmer_analysis {
-                let kmers = count_kmers_parallel(&acc.kmer_seqs);
-                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+        }
+        if config.flags.kmer_analysis {
+            for (dst, &src) in kmer_table_total.iter_mut().zip(acc.kmer_table.iter()) {
+                *dst += src;
             }
         }
         merge_batch_into_totals(
@@ -549,7 +544,7 @@ fn collect_raw_stats_needletail(
     raw.length_histogram      = length_histogram;
     raw.quality_by_position   = quality_by_pos;
     raw.qual_hist_by_position = qual_hist_by_pos;
-    raw.kmer_counts           = kmer_total;
+    raw.kmer_counts           = kmer_table_to_map(&kmer_table_total);
     raw.dup_rate_pct          = dup_rate;
     raw.per_tile_quality      = per_tile;
     raw.base_composition      = base_composition;
@@ -591,7 +586,7 @@ fn collect_raw_stats_mmap(
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
-    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -656,21 +651,17 @@ fn collect_raw_stats_mmap(
         if config.flags.duplication_check {
             for &fp in &acc.fingerprints { hll.insert(&fp); }
         }
-        if !acc.kmer_seqs.is_empty() {
-            if config.flags.overrep_sequences {
-                for seq in &acc.kmer_seqs {
-                    if overrep_sampled < OVERREP_SAMPLE {
-                        let mut key = [0u8; 50];
-                        let n = seq.len().min(50);
-                        key[..n].copy_from_slice(&seq[..n]);
-                        *overrep_map.entry(key).or_insert(0) += 1;
-                        overrep_sampled += 1;
-                    }
+        if config.flags.overrep_sequences && !acc.overrep_seqs.is_empty() {
+            for key in &acc.overrep_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(*key).or_insert(0) += 1;
+                    overrep_sampled += 1;
                 }
             }
-            if config.flags.kmer_analysis {
-                let kmers = count_kmers_parallel(&acc.kmer_seqs);
-                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+        }
+        if config.flags.kmer_analysis {
+            for (dst, &src) in kmer_table_total.iter_mut().zip(acc.kmer_table.iter()) {
+                *dst += src;
             }
         }
         merge_batch_into_totals(
@@ -717,7 +708,7 @@ fn collect_raw_stats_mmap(
     raw.length_histogram      = length_histogram;
     raw.quality_by_position   = quality_by_pos;
     raw.qual_hist_by_position = qual_hist_by_pos;
-    raw.kmer_counts           = kmer_total;
+    raw.kmer_counts           = kmer_table_to_map(&kmer_table_total);
     raw.dup_rate_pct          = dup_rate;
     raw.per_tile_quality      = per_tile;
     raw.base_composition      = base_composition;
@@ -831,7 +822,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
-    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
@@ -987,23 +978,17 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         }
 
         // --- Overrepresented sequences + K-mer counting ---
-        if !acc.kmer_seqs.is_empty() {
-            if config.flags.overrep_sequences {
-                for seq in &acc.kmer_seqs {
-                    if overrep_sampled < OVERREP_SAMPLE {
-                        let mut key = [0u8; 50];
-                        let n = seq.len().min(50);
-                        key[..n].copy_from_slice(&seq[..n]);
-                        *overrep_map.entry(key).or_insert(0) += 1;
-                        overrep_sampled += 1;
-                    }
+        if config.flags.overrep_sequences && !acc.overrep_seqs.is_empty() {
+            for key in &acc.overrep_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(*key).or_insert(0) += 1;
+                    overrep_sampled += 1;
                 }
             }
-            if config.flags.kmer_analysis {
-                let kmers = count_kmers_parallel(&acc.kmer_seqs);
-                for (k, v) in kmers {
-                    *kmer_total.entry(k).or_insert(0) += v;
-                }
+        }
+        if config.flags.kmer_analysis {
+            for (dst, &src) in kmer_table_total.iter_mut().zip(acc.kmer_table.iter()) {
+                *dst += src;
             }
         }
 
@@ -1130,7 +1115,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.length_histogram      = length_histogram;
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
-        cur.kmer_counts           = kmer_total;
+        cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
         cur.dup_rate_pct          = dup_rate;
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
@@ -1230,7 +1215,7 @@ fn process_single_file_mmap(
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
-    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut kmer_table_total = [0u64; 256];
     let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
@@ -1372,21 +1357,17 @@ fn process_single_file_mmap(
                 hll.insert(&fp);
             }
         }
-        if !acc.kmer_seqs.is_empty() {
-            if config.flags.overrep_sequences {
-                for seq in &acc.kmer_seqs {
-                    if overrep_sampled < OVERREP_SAMPLE {
-                        let mut key = [0u8; 50];
-                        let n = seq.len().min(50);
-                        key[..n].copy_from_slice(&seq[..n]);
-                        *overrep_map.entry(key).or_insert(0) += 1;
-                        overrep_sampled += 1;
-                    }
+        if config.flags.overrep_sequences && !acc.overrep_seqs.is_empty() {
+            for key in &acc.overrep_seqs {
+                if overrep_sampled < OVERREP_SAMPLE {
+                    *overrep_map.entry(*key).or_insert(0) += 1;
+                    overrep_sampled += 1;
                 }
             }
-            if config.flags.kmer_analysis {
-                let kmers = count_kmers_parallel(&acc.kmer_seqs);
-                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+        }
+        if config.flags.kmer_analysis {
+            for (dst, &src) in kmer_table_total.iter_mut().zip(acc.kmer_table.iter()) {
+                *dst += src;
             }
         }
 
@@ -1510,7 +1491,7 @@ fn process_single_file_mmap(
         cur.length_histogram      = length_histogram;
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
-        cur.kmer_counts           = kmer_total;
+        cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
         cur.dup_rate_pct          = dup_rate;
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
@@ -1747,7 +1728,7 @@ fn process_paired_files(
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
     let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
-    let mut kmer_total: HashMap<[u8; 4], u64> = HashMap::with_capacity(256);
+    let mut kmer_table_total = [0u64; 256];
     let mut hll_pe: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map_pe: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled_pe = 0usize;
@@ -1831,21 +1812,17 @@ fn process_paired_files(
                 hll_pe.insert(&fp);
             }
         }
-        if !acc.kmer_seqs.is_empty() {
-            if config.flags.overrep_sequences {
-                for seq in &acc.kmer_seqs {
-                    if overrep_sampled_pe < OVERREP_SAMPLE {
-                        let mut key = [0u8; 50];
-                        let n = seq.len().min(50);
-                        key[..n].copy_from_slice(&seq[..n]);
-                        *overrep_map_pe.entry(key).or_insert(0) += 1;
-                        overrep_sampled_pe += 1;
-                    }
+        if config.flags.overrep_sequences && !acc.overrep_seqs.is_empty() {
+            for key in &acc.overrep_seqs {
+                if overrep_sampled_pe < OVERREP_SAMPLE {
+                    *overrep_map_pe.entry(*key).or_insert(0) += 1;
+                    overrep_sampled_pe += 1;
                 }
             }
-            if config.flags.kmer_analysis {
-                let kmers = count_kmers_parallel(&acc.kmer_seqs);
-                for (k, v) in kmers { *kmer_total.entry(k).or_insert(0) += v; }
+        }
+        if config.flags.kmer_analysis {
+            for (dst, &src) in kmer_table_total.iter_mut().zip(acc.kmer_table.iter()) {
+                *dst += src;
             }
         }
 
@@ -1922,7 +1899,7 @@ fn process_paired_files(
         cur.length_histogram      = length_histogram;
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
-        cur.kmer_counts           = kmer_total;
+        cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
         cur.dup_rate_pct          = dup_rate_pe;
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
