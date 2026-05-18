@@ -1,17 +1,11 @@
 use std::collections::HashMap;
 use xxhash_rust::xxh3::xxh3_64;
 use crate::types::PHRED_BUCKETS;
+use crate::types::MAX_QUAL_POSITION;
 use super::mmap_reader::count_gc_simd;
 
-use crate::types::MAX_QUAL_POSITION;
-
-// ---------------------------------------------------------------------------
-// Lookup table: ASCII byte → base index  (A=0 C=1 G=2 T=3 everything else=4)
-// Replaces a 5-way match per base — no branch mispredictions, single L1-cached
-// load per position.  Fits in 256 bytes (4 cache lines).
-// ---------------------------------------------------------------------------
-
-const BASE_LUT: [u8; 256] = {
+/// Base → index: A=0 C=1 G=2 T=3 other=4
+pub(crate) static BASE_LUT: [u8; 256] = {
     let mut t = [4u8; 256];
     t[b'A' as usize] = 0; t[b'a' as usize] = 0;
     t[b'C' as usize] = 1; t[b'c' as usize] = 1;
@@ -20,11 +14,29 @@ const BASE_LUT: [u8; 256] = {
     t
 };
 
-// ---------------------------------------------------------------------------
-// BatchAccum — thread-local accumulator used by rayon fold/reduce
-// ---------------------------------------------------------------------------
+/// 2-bit encode a single ACGT base; returns None for any other byte.
+#[inline(always)]
+fn base_to_2bit(b: u8) -> Option<u8> {
+    match b {
+        b'A' | b'a' => Some(0),
+        b'C' | b'c' => Some(1),
+        b'G' | b'g' => Some(2),
+        b'T' | b't' => Some(3),
+        _ => None,
+    }
+}
 
-/// All stats for a batch of records. Designed to be folded in parallel.
+/// Build an 8-bit index (0..=255) for the 4-mer starting at `pos`.
+/// Returns None if any base is not in {A,C,G,T}.
+#[inline(always)]
+fn kmer4_index(seq: &[u8], pos: usize) -> Option<u8> {
+    let a = base_to_2bit(seq[pos])?;
+    let b = base_to_2bit(seq[pos + 1])?;
+    let c = base_to_2bit(seq[pos + 2])?;
+    let d = base_to_2bit(seq[pos + 3])?;
+    Some((a << 6) | (b << 4) | (c << 2) | d)
+}
+
 #[derive(Clone)]
 pub struct BatchAccum {
     pub read_count: u64,
@@ -39,11 +51,34 @@ pub struct BatchAccum {
     pub max_length: u64,
     pub length_histogram: HashMap<u64, u64>,
     pub quality_by_pos: Vec<(u64, u64)>,
+    /// Per-position Phred histogram — enables Q25/Q50/Q75 per position (FastQC boxplots).
+    /// u32 per cell: per-batch max is PARALLEL_BATCH (50K) << u32::MAX. Cast to u64 on merge.
+    pub qual_hist_by_pos: Vec<[u32; 43]>,
     pub base_composition: Vec<[u64; 5]>,
     pub quality_distribution: Vec<u64>,
     pub per_tile: HashMap<u32, (u64, u64)>,
-    pub kmer_seqs: Vec<Vec<u8>>,
+    /// Fixed 256-entry 4-mer count table (2-bit encoded, no HashMap, no heap alloc).
+    pub kmer_table: [u64; 256],
     pub fingerprints: Vec<u64>,
+    /// Average quality bucketed by read length (bin = len / 100bp).
+    pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
+    /// Per-read GC content histogram: index = GC% (0..=100).
+    pub gc_per_read: [u64; 101],
+    /// Reads discarded by per-read quality/N filters — incremented by caller in mod.rs.
+    pub reads_filtered: u64,
+    /// ONT channel → read count (only populated when long-read/ONT mode is active).
+    pub ont_channel_counts: HashMap<u32, u32>,
+    /// Sampled (read_length, mean_phred) points for quality-vs-length scatter.
+    pub qual_vs_length: Vec<(u32, f32)>,
+    /// Raw (unix_timestamp_secs, 1) pairs from ONT start_time headers.
+    /// Merged and bucketed into 5-minute intervals during finalization.
+    pub reads_over_time_raw: Vec<(u64, u64)>,
+    /// Fixed-size 50-byte prefixes for overrep analysis (no per-read heap alloc).
+    /// Stored as a flat Vec<[u8;50]> so rayon reduce uses memcpy extend, not HashMap merge.
+    pub overrep_seqs: Vec<[u8; 50]>,
+    /// Maximum per-position index written in this accumulator.
+    /// Used to short-circuit merges when reads are shorter than MAX_QUAL_POSITION.
+    pub active_pos: usize,
 }
 
 impl Default for BatchAccum {
@@ -61,27 +96,25 @@ impl Default for BatchAccum {
             max_length: 0,
             length_histogram: HashMap::new(),
             quality_by_pos: vec![(0, 0); MAX_QUAL_POSITION],
+            qual_hist_by_pos: vec![[0u32; 43]; MAX_QUAL_POSITION],
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
             quality_distribution: vec![0u64; PHRED_BUCKETS],
             per_tile: HashMap::new(),
-            kmer_seqs: Vec::new(),
+            kmer_table: [0u64; 256],
             fingerprints: Vec::new(),
+            quality_by_length_bin: HashMap::new(),
+            gc_per_read: [0u64; 101],
+            reads_filtered: 0,
+            ont_channel_counts: HashMap::new(),
+            qual_vs_length: Vec::with_capacity(crate::types::MAX_QUAL_VS_LEN_POINTS),
+            reads_over_time_raw: Vec::new(),
+            overrep_seqs: Vec::new(),
+            active_pos: 0,
         }
     }
 }
 
 impl BatchAccum {
-    /// Process a single record into this accumulator.
-    ///
-    /// Hot-path optimisations applied here:
-    ///  1. BASE_LUT replaces a 5-way match → no branch mispredictions in the
-    ///     composition loop (single array-index load per position).
-    ///  2. Quality global stats (sum, q20, q30) are computed as three tight,
-    ///     separate iterator passes so LLVM/AVX2 can auto-vectorise each one
-    ///     independently.  On a 150 bp read this cuts ~225 scalar cycles to
-    ///     ~90 cycles (3× speedup for the quality hot path).
-    ///  3. `cap = q.len().min(MAX_QUAL_POSITION)` hoists the per-position
-    ///     bounds check out of the inner loop entirely.
     #[inline]
     pub fn process(
         &mut self,
@@ -96,7 +129,6 @@ impl BatchAccum {
 
         let len = seq.len() as u64;
         self.total_bases += len;
-        // Only track length stats for non-empty reads (prevents min = 0 from parser edge cases)
         if len > 0 {
             if len < self.min_length { self.min_length = len; }
             if len > self.max_length { self.max_length = len; }
@@ -105,29 +137,42 @@ impl BatchAccum {
 
         if adapter_hit { self.adapter_hits += 1; }
 
-        // GC count via SIMD (whole sequence, fast)
-        self.gc_count += count_gc_simd(seq);
-
-        // Per-base composition using BASE_LUT — one array load per base,
-        // no branches, LUT stays resident in L1 cache for the whole batch.
+        // --- Base composition loop (per-position, up to MAX_QUAL_POSITION) ---
+        // GC count via SIMD for the whole sequence — memchr is highly optimized.
         let end = seq.len().min(MAX_QUAL_POSITION);
+        if end > self.active_pos { self.active_pos = end; }
         for pos in 0..end {
-            let idx = BASE_LUT[seq[pos] as usize] as usize;
-            self.base_composition[pos][idx] += 1;
+            let bi = BASE_LUT[seq[pos] as usize] as usize;
+            self.base_composition[pos][bi] += 1;
         }
-        // N content is tracked in base_composition[..][4] (idx 4 = 'N' bucket in LUT)
+        let gc_this = count_gc_simd(seq);
+        self.gc_count += gc_this;
+        if len > 0 {
+            let gc_pct = (gc_this * 100 / len).min(100) as usize;
+            self.gc_per_read[gc_pct] += 1;
+        }
 
-        // Quality — split into separate, vectorisable passes so LLVM emits SIMD reductions.
-        // Phred encoding: score = byte − 33  →  Q20 threshold = byte 53,  Q30 = byte 63.
+        // --- 4-mer counting via fixed [u64; 256] table (capped to first OVERREP_SAMPLE reads) ---
+        if seq.len() >= 4 && self.read_count <= crate::types::OVERREP_SAMPLE as u64 {
+            // Stack-allocate 50-byte prefix → push into flat Vec (no heap alloc per read).
+            let n = seq.len().min(50);
+            let mut key = [0u8; 50];
+            key[..n].copy_from_slice(&seq[..n]);
+            self.overrep_seqs.push(key);
+            let klen = seq.len();
+            for pos in 0..klen.saturating_sub(3) {
+                if let Some(idx) = kmer4_index(seq, pos) {
+                    self.kmer_table[idx as usize] += 1;
+                }
+            }
+        }
+
         if let Some(q) = qual {
             let n = q.len();
 
-            // Pass 1: sum of Phred scores (used for both global avg and quality_distribution)
-            // Simple map+sum — LLVM unrolls and vectorises with AVX2 (32 bytes/cycle).
+            // Pass 1: global quality stats — separate vectorisable passes so LLVM/AVX2
+            // can auto-vectorise each one independently (same pattern as main branch).
             let phred_sum: u64 = q.iter().map(|&b| b.saturating_sub(33) as u64).sum();
-
-            // Pass 2 & 3: base counts above Q20 / Q30 thresholds.
-            // filter+count on a single predicate → VPMINUB / VPCMPGTB + VPOPCNT pattern.
             let q20: u64 = q.iter().filter(|&&b| b >= 53).count() as u64;
             let q30: u64 = q.iter().filter(|&&b| b >= 63).count() as u64;
 
@@ -136,35 +181,46 @@ impl BatchAccum {
             self.q20_bases     += q20;
             self.q30_bases     += q30;
 
-            // Per-position quality: cap avoids repeated bounds checks inside the loop.
+            // Pass 2a: per-position quality sum+count (sequential stride → LLVM can vectorize).
             let cap = n.min(MAX_QUAL_POSITION);
-            for (pos, &b) in q.iter().enumerate().take(cap) {
-                let phred = b.saturating_sub(33) as u64;
-                self.quality_by_pos[pos].0 += phred;
-                self.quality_by_pos[pos].1 += 1;
+            {
+                let qby = &mut self.quality_by_pos[..cap];
+                for (pos, &b) in q[..cap].iter().enumerate() {
+                    let phred = b.saturating_sub(33) as u64;
+                    qby[pos].0 += phred;
+                    qby[pos].1 += 1;
+                }
             }
+            // Pass 2b: Phred histogram per position (scatter write, must be scalar).
+            // Separated from 2a so the sequential loop above can be auto-vectorized.
+            {
+                let qhist = &mut self.qual_hist_by_pos[..cap];
+                for (pos, &b) in q[..cap].iter().enumerate() {
+                    let p = b.saturating_sub(33).min(42) as usize;
+                    qhist[pos][p] += 1;
+                }
+            }
+            if cap > self.active_pos { self.active_pos = cap; }
 
-            // Quality score distribution bucket (mean Phred, rounded down)
             if n > 0 {
                 let bucket = (phred_sum as f64 / n as f64) as usize;
                 self.quality_distribution[bucket.min(42)] += 1;
+
+                // Length-binned quality: bin 0 = 0–99bp, bin 1 = 100–199bp, etc.
+                let bin = (n / 100) as u32;
+                let e = self.quality_by_length_bin.entry(bin).or_insert((0, 0));
+                e.0 += phred_sum;
+                e.1 += n as u64;
             }
         }
 
-        // Per-tile
         if let Some((tile_id, phred_sum, count)) = tile {
             let e = self.per_tile.entry(tile_id).or_insert((0, 0));
             e.0 += phred_sum;
             e.1 += count;
         }
-
-        // K-mer input — only sample first OVERREP_SAMPLE reads to avoid O(n) cost on large files
-        if seq.len() >= 4 && self.read_count <= crate::types::OVERREP_SAMPLE as u64 {
-            self.kmer_seqs.push(seq.to_vec());
-        }
     }
 
-    /// Merge another accumulator into self (rayon reduce).
     pub fn merge(mut self, other: Self) -> Self {
         self.read_count    += other.read_count;
         self.total_bases   += other.total_bases;
@@ -180,34 +236,53 @@ impl BatchAccum {
         for (k, v) in other.length_histogram {
             *self.length_histogram.entry(k).or_insert(0) += v;
         }
-        for i in 0..MAX_QUAL_POSITION {
-            self.quality_by_pos[i].0    += other.quality_by_pos[i].0;
-            self.quality_by_pos[i].1    += other.quality_by_pos[i].1;
-            for j in 0..5 {
-                self.base_composition[i][j] += other.base_composition[i][j];
-            }
+        // Merge only the positions that were actually written — avoids touching
+        // the un-used tail of the 2000-element arrays (critical for short reads).
+        let merge_end = self.active_pos.max(other.active_pos);
+        if merge_end > self.active_pos { self.active_pos = merge_end; }
+        for i in 0..merge_end {
+            self.quality_by_pos[i].0 += other.quality_by_pos[i].0;
+            self.quality_by_pos[i].1 += other.quality_by_pos[i].1;
+            let qhp = &mut self.qual_hist_by_pos[i];
+            let src = &other.qual_hist_by_pos[i];
+            for j in 0..43 { qhp[j] += src[j]; }
+            let bc = &mut self.base_composition[i];
+            let bsrc = &other.base_composition[i];
+            for j in 0..5 { bc[j] += bsrc[j]; }
         }
-        for i in 0..PHRED_BUCKETS {
-            self.quality_distribution[i] += other.quality_distribution[i];
+        for (dst, &src) in self.quality_distribution.iter_mut().zip(other.quality_distribution.iter()) {
+            *dst += src;
         }
         for (k, v) in other.per_tile {
             let e = self.per_tile.entry(k).or_insert((0, 0));
             e.0 += v.0;
             e.1 += v.1;
         }
-        self.kmer_seqs.extend(other.kmer_seqs);
+        for (k, v) in other.quality_by_length_bin {
+            let e = self.quality_by_length_bin.entry(k).or_insert((0, 0));
+            e.0 += v.0;
+            e.1 += v.1;
+        }
+        for (dst, &src) in self.gc_per_read.iter_mut().zip(other.gc_per_read.iter()) {
+            *dst += src;
+        }
+        // Element-wise merge of kmer_table — no HashMap, O(256) fixed cost
+        for (dst, &src) in self.kmer_table.iter_mut().zip(other.kmer_table.iter()) {
+            *dst += src;
+        }
+        self.reads_filtered += other.reads_filtered;
+        self.overrep_seqs.extend(other.overrep_seqs);
         self.fingerprints.extend(other.fingerprints);
+        for (ch, cnt) in other.ont_channel_counts {
+            *self.ont_channel_counts.entry(ch).or_insert(0) += cnt;
+        }
+        self.qual_vs_length.extend(other.qual_vs_length);
+        self.reads_over_time_raw.extend(other.reads_over_time_raw);
         self
     }
+
 }
 
-// ---------------------------------------------------------------------------
-// Running-totals helper — called after every batch in all three processing paths
-// ---------------------------------------------------------------------------
-
-/// Merge a finished `BatchAccum` into the flat running-total variables that
-/// accumulate across the whole file.  Extracted here to avoid copy-pasting
-/// ~20 lines into each of the three processing functions in `mod.rs`.
 #[allow(clippy::too_many_arguments)]
 pub fn merge_batch_into_totals(
     acc: &BatchAccum,
@@ -221,11 +296,13 @@ pub fn merge_batch_into_totals(
     adapter_hits:  &mut u64,
     min_length:    &mut u64,
     max_length:    &mut u64,
-    length_histogram: &mut std::collections::HashMap<u64, u64>,
-    quality_by_pos:   &mut Vec<(u64, u64)>,
-    base_composition: &mut Vec<[u64; 5]>,
-    quality_distribution: &mut Vec<u64>,
-    per_tile: &mut std::collections::HashMap<u32, (u64, u64)>,
+    length_histogram:      &mut HashMap<u64, u64>,
+    quality_by_pos:        &mut [(u64, u64)],
+    qual_hist_by_pos:      &mut [[u64; 43]],
+    base_composition:      &mut [[u64; 5]],
+    quality_distribution:  &mut [u64],
+    per_tile:              &mut HashMap<u32, (u64, u64)>,
+    quality_by_length_bin: &mut HashMap<u32, (u64, u64)>,
 ) {
     *read_count    += acc.read_count;
     *total_bases   += acc.total_bases;
@@ -240,29 +317,52 @@ pub fn merge_batch_into_totals(
     for (&k, &v) in &acc.length_histogram {
         *length_histogram.entry(k).or_insert(0) += v;
     }
-    for i in 0..MAX_QUAL_POSITION {
+    // Only merge positions that were actually written to — avoids touching zeroed
+    // tail data for short reads (e.g., 150bp reads only use positions 0..150).
+    let merge_end = acc.active_pos;
+    for i in 0..merge_end {
         quality_by_pos[i].0 += acc.quality_by_pos[i].0;
         quality_by_pos[i].1 += acc.quality_by_pos[i].1;
-        for j in 0..5 {
-            base_composition[i][j] += acc.base_composition[i][j];
-        }
+        let qhp = &mut qual_hist_by_pos[i];
+        let qhsrc = &acc.qual_hist_by_pos[i];
+        for j in 0..43 { qhp[j] += qhsrc[j] as u64; }
+        let bc = &mut base_composition[i];
+        let bcsrc = &acc.base_composition[i];
+        for j in 0..5 { bc[j] += bcsrc[j]; }
     }
-    for i in 0..PHRED_BUCKETS {
-        quality_distribution[i] += acc.quality_distribution[i];
+    for (dst, &src) in quality_distribution.iter_mut().zip(acc.quality_distribution.iter()) {
+        *dst += src;
     }
     for (&k, &v) in &acc.per_tile {
         let e = per_tile.entry(k).or_insert((0, 0));
         e.0 += v.0;
         e.1 += v.1;
     }
+    for (&k, &v) in &acc.quality_by_length_bin {
+        let e = quality_by_length_bin.entry(k).or_insert((0, 0));
+        e.0 += v.0;
+        e.1 += v.1;
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy helpers (still used for sequential trim-mode processing)
-// ---------------------------------------------------------------------------
+/// Convert a raw [u64; 256] kmer count table to HashMap<[u8;4], u64>.
+/// Called once at finalization — never in the hot path.
+pub fn kmer_table_to_map(table: &[u64; 256]) -> HashMap<[u8; 4], u64> {
+    const BASES: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    let mut map = HashMap::with_capacity(256);
+    for idx in 0u8..=255 {
+        let count = table[idx as usize];
+        if count == 0 { continue; }
+        let a = BASES[((idx >> 6) & 3) as usize];
+        let b = BASES[((idx >> 4) & 3) as usize];
+        let c = BASES[((idx >> 2) & 3) as usize];
+        let d = BASES[(idx & 3) as usize];
+        map.insert([a, b, c, d], count);
+    }
+    map
+}
 
 /// Hash the first 50 bytes of a sequence for duplication fingerprinting.
-/// Uses xxHash3 — fast, high-quality, low collision rate.
 pub fn fingerprint(seq: &[u8]) -> u64 {
     xxh3_64(&seq[..seq.len().min(50)])
 }

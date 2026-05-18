@@ -27,6 +27,10 @@ pub const ADAPTERS: &[(&str, &[u8])] = &[
     ("Small RNA 3-prime",  b"TGGAATTCTCGGGTGCCAAGG"),
     ("Poly-A",             b"AAAAAAAAAAAAAAAAAAAAAA"),
     ("Poly-T",             b"TTTTTTTTTTTTTTTTTTTTTT"),
+    // Oxford Nanopore Technologies adapters
+    ("ONT Ligation (SQK-LSK)", b"AATGTACTTCGTTCAGTTACGTATTGCT"),
+    ("ONT PCR (SQK-PCS)",      b"ACTTGCCTGTCGCTCTATCTTC"),
+    ("ONT Rapid (SQK-RAD)",    b"GCTTGGGTGTTTAACCTTTTTTCGCAACGGGT"),
 ];
 
 // Minimum bp of adapter prefix that must match exactly
@@ -83,6 +87,9 @@ pub struct OverrepSeq {
     pub possible_source: String,
 }
 
+/// Maximum number of qual-vs-length scatter points to keep.
+pub const MAX_QUAL_VS_LEN_POINTS: usize = 2000;
+
 /// Controls which optional QC modules and outputs are enabled.
 /// All fields default to `true` (everything on).
 #[derive(Debug, Clone)]
@@ -130,6 +137,30 @@ pub struct ProcessConfig {
     pub custom_adapters: Vec<Vec<u8>>,
     /// If > 0, quality-trim the 3' end: drop trailing bases with Phred < threshold
     pub quality_trim_threshold: u8,
+    /// Trim poly-G tails >= this many bp (0 = disabled). Auto-detect NovaSeq/NextSeq: not implemented yet, set manually.
+    pub poly_g_min_len: u8,
+    /// Trim poly-X tails >= this many bp (0 = disabled).
+    pub poly_x_min_len: u8,
+    /// Sliding window cut-right: window size (0 = disabled). Cuts from first bad window to read end.
+    pub cut_right_window: u8,
+    /// Sliding window cut-right: Phred quality threshold (default 20).
+    pub cut_right_qual: u8,
+    /// Sliding window cut-front: window size (0 = disabled). Trims bad quality from 5' end.
+    pub cut_front_window: u8,
+    /// Sliding window cut-front: Phred quality threshold (default 20).
+    pub cut_front_qual: u8,
+    /// Sliding window cut-tail: window size (0 = disabled). Trims bad quality from 3' end.
+    pub cut_tail_window: u8,
+    /// Sliding window cut-tail: Phred quality threshold (default 20).
+    pub cut_tail_qual: u8,
+    /// Hard-trim this many bases from the 5' end of every read (0 = disabled).
+    pub trim_front_bases: u16,
+    /// Hard-trim this many bases from the 3' end of every read (0 = disabled).
+    pub trim_tail_bases: u16,
+    /// Discard reads whose mean Phred quality (post-trim) is below this value (0 = disabled).
+    pub min_avg_quality: u8,
+    /// Discard reads with more than this many N bases (post-trim). None = disabled.
+    pub max_n_bases: Option<u32>,
     /// Abort on first malformed record instead of skipping it
     pub strict: bool,
     /// If set, treat input as paired-end: this is the R2 file path.
@@ -137,6 +168,15 @@ pub struct ProcessConfig {
     pub paired_end_r2: Option<String>,
     /// Feature flags controlling which QC modules and outputs are active
     pub flags: FeatureFlags,
+    /// Force long-read mode (ONT/PacBio) regardless of auto-detection.
+    pub is_long_read: bool,
+    /// Hint that the data is specifically from ONT (vs generic long-read / PacBio).
+    /// Reserved for future ONT-specific processing; currently informational.
+    #[allow(dead_code)]
+    pub is_ont: bool,
+    /// When true and trim_output is also true, run a pre-pass collecting raw stats
+    /// before trimming so a before/after comparison report can be generated.
+    pub compare: bool,
 }
 
 impl Default for ProcessConfig {
@@ -147,9 +187,24 @@ impl Default for ProcessConfig {
             output_dir: ".".to_string(),
             custom_adapters: Vec::new(),
             quality_trim_threshold: 0,
+            poly_g_min_len: 0,
+            poly_x_min_len: 0,
+            cut_right_window: 0,
+            cut_right_qual: 20,
+            cut_front_window: 0,
+            cut_front_qual: 20,
+            cut_tail_window: 0,
+            cut_tail_qual: 20,
+            trim_front_bases: 0,
+            trim_tail_bases: 0,
+            min_avg_quality: 0,
+            max_n_bases: None,
             strict: false,
             paired_end_r2: None,
             flags: FeatureFlags::default(),
+            is_long_read: false,
+            is_ont: false,
+            compare: false,
         }
     }
 }
@@ -185,6 +240,8 @@ pub struct FileStats {
     pub trimmed_reads: u64,
     pub trimmed_bases_removed: u64,
     pub trim_output_path: Option<String>,
+    /// Reads discarded by per-read quality/N filters (post-trim)
+    pub reads_filtered: u64,
     // Duplication estimate via HyperLogLog (all reads)
     pub dup_rate_pct: f64,
     // Per-tile quality (Illumina only): tile_id -> (phred_sum, count)
@@ -193,10 +250,33 @@ pub struct FileStats {
     pub base_composition: Vec<[u64; 5]>,
     // Quality score distribution: count of reads per mean Phred score (index = floor(phred))
     pub quality_distribution: Vec<u64>,
+    // Per-position Phred histogram for Q25/Q50/Q75 boxplot (FastQC-style)
+    pub qual_hist_by_position: Vec<[u64; 43]>,
+    // Average quality per length bin (bin = len/100bp): (phred_sum, count)
+    pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
+    // Trim counts broken down by adapter name
+    pub trimmed_by_adapter: HashMap<String, u64>,
     // Overrepresented sequences (sampled from first OVERREP_SAMPLE reads)
     pub overrepresented_sequences: Vec<OverrepSeq>,
     // Per-module QC pass/warn/fail status (FastQC-style traffic lights)
     pub module_status: Vec<(String, QcStatus)>,
+    // Per-read GC content histogram: index = GC% (0..=100), value = read count
+    pub gc_distribution: Vec<u64>,
+    // Duplication level histogram: percentage of reads at each duplication level (9 bins)
+    pub dup_level_histogram: Vec<f64>,
+    // Long-read / ONT specific fields
+    /// True when this file was processed in long-read mode.
+    pub long_read_mode: bool,
+    /// ONT channel → read count (only populated for ONT reads).
+    pub ont_channel_counts: HashMap<u32, u32>,
+    /// Cumulative reads over time: (minutes_since_run_start, cumulative_reads).
+    /// Bucketed into 5-minute intervals; only non-empty for ONT reads.
+    pub reads_over_time: Vec<(u64, u64)>,
+    /// Sampled (read_length, mean_phred_quality) points; max 2000 entries.
+    pub qual_vs_length: Vec<(u32, f32)>,
+    /// When comparison mode is active (--compare --trim), this holds the RAW
+    /// (pre-trim) stats; the main FileStats fields hold the post-trim stats.
+    pub comparison_stats: Option<Box<FileStats>>,
 }
 
 impl FileStats {
@@ -221,12 +301,23 @@ impl FileStats {
             trimmed_reads: 0,
             trimmed_bases_removed: 0,
             trim_output_path: None,
+            reads_filtered: 0,
             dup_rate_pct: 0.0,
             per_tile_quality: HashMap::new(),
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
             quality_distribution: vec![0u64; PHRED_BUCKETS],
+            qual_hist_by_position: vec![[0u64; 43]; MAX_QUAL_POSITION],
+            quality_by_length_bin: HashMap::new(),
+            trimmed_by_adapter: HashMap::new(),
             overrepresented_sequences: Vec::new(),
             module_status: Vec::new(),
+            gc_distribution: vec![0u64; 101],
+            dup_level_histogram: vec![0.0; 9],
+            long_read_mode: false,
+            ont_channel_counts: HashMap::new(),
+            reads_over_time: Vec::new(),
+            qual_vs_length: Vec::new(),
+            comparison_stats: None,
         }
     }
 
@@ -293,7 +384,7 @@ impl FileStats {
         sorted.sort_by(|a, b| b.0.cmp(&a.0));
 
         let n50_thresh = self.total_bases.div_ceil(2);
-        let n90_thresh = self.total_bases * 9 / 10;
+        let n90_thresh = (self.total_bases * 9).div_ceil(10);
 
         let mut cumsum = 0u64;
         let mut n50 = 0u64;
@@ -396,6 +487,51 @@ impl FileStats {
             .iter()
             .map(|pct| pct[4])
             .collect()
+    }
+
+    /// Q25, Q50 (median), Q75 per base position — FastQC-style boxplot data.
+    /// Returns vec of [q25, q50, q75] in Phred units, trimmed to last covered position.
+    pub fn qual_percentiles_per_position(&self) -> Vec<[f64; 3]> {
+        let last = self.qual_hist_by_position
+            .iter()
+            .rposition(|h| h.iter().any(|&c| c > 0))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        self.qual_hist_by_position[..last]
+            .iter()
+            .map(|hist| {
+                let total: u64 = hist.iter().sum();
+                if total == 0 { return [0.0; 3]; }
+                let q25_thresh = total / 4;
+                let q50_thresh = total / 2;
+                let q75_thresh = total * 3 / 4;
+                let mut cumsum = 0u64;
+                let mut q25 = 0usize;
+                let mut q50 = 0usize;
+                let mut q75 = 0usize;
+                for (score, &count) in hist.iter().enumerate() {
+                    cumsum += count;
+                    if q25 == 0 && cumsum >= q25_thresh { q25 = score; }
+                    if q50 == 0 && cumsum >= q50_thresh { q50 = score; }
+                    if q75 == 0 && cumsum >= q75_thresh { q75 = score; }
+                    if q75 > 0 { break; }
+                }
+                [q25 as f64, q50 as f64, q75 as f64]
+            })
+            .collect()
+    }
+
+    #[allow(dead_code)]
+    /// Average quality per length bin, sorted by bin index.
+    pub fn avg_quality_by_length(&self) -> Vec<(u32, f64)> {
+        let mut v: Vec<(u32, f64)> = self.quality_by_length_bin
+            .iter()
+            .map(|(&bin, &(sum, cnt))| {
+                (bin * 100, if cnt == 0 { 0.0 } else { sum as f64 / cnt as f64 })
+            })
+            .collect();
+        v.sort_by_key(|(bp, _)| *bp);
+        v
     }
 
     /// Top N k-mers by frequency.
