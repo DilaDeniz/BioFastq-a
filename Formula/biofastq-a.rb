@@ -2,7 +2,7 @@ class BiofastqA < Formula
   desc "High-performance FASTQ/FASTA quality analysis — written in Rust"
   homepage "https://github.com/DilaDeniz/BioFastq-a"
   url "https://github.com/DilaDeniz/BioFastq-a/archive/refs/tags/v2.3.0.tar.gz"
-  sha256 "PLACEHOLDER_SHA256_UPDATE_BEFORE_PUBLISHING"
+  sha256 "1046cf0638c3e7c02078901797a9e4523599a86f7422d71a3db1a6e4dfd425b8"
   license "MIT"
   head "https://github.com/DilaDeniz/BioFastq-a.git", branch: "main"
 
