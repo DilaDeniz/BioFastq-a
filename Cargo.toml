@@ -1,6 +1,6 @@
 [package]
 name = "biofastq-a"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
 description = "BioFastq-A - High-performance FASTQ/FASTA quality analysis with HTML reports"
 license = "MIT"
