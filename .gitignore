@@ -1,4 +1,6 @@
 /target
+/wasm/target
+/wasm/www/pkg
 
 # Reports
 *_report.json

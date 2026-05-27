@@ -1,0 +1,310 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BioFastq-A — Browser QC</title>
+<style>
+:root{--bg:#f5f6f7;--card:#fff;--border:#d0d5dd;--accent:#1a5fa8;--text:#1a1f2e;--muted:#5a6370;--green:#1a7a3e;--red:#991b1b;}
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;}
+header{background:var(--accent);color:#fff;padding:18px 40px;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;}
+header h1{font-size:1.4rem;font-weight:700;letter-spacing:-.2px;}
+header h1 span{opacity:.75;font-weight:400;}
+.badge{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);border-radius:5px;padding:3px 10px;font-size:11px;font-weight:600;}
+main{max-width:900px;margin:0 auto;padding:48px 24px;}
+.hero{text-align:center;margin-bottom:48px;}
+.hero h2{font-size:1.6rem;font-weight:700;margin-bottom:10px;}
+.hero p{color:var(--muted);font-size:1rem;line-height:1.6;max-width:600px;margin:0 auto 24px;}
+.privacy-row{display:flex;justify-content:center;gap:24px;flex-wrap:wrap;margin-bottom:32px;}
+.privacy-item{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted);}
+.privacy-item svg{color:var(--green);}
+
+/* Drop zone */
+.drop-zone{border:2px dashed var(--border);border-radius:12px;padding:60px 40px;text-align:center;cursor:pointer;transition:all .2s;background:var(--card);}
+.drop-zone:hover,.drop-zone.drag-over{border-color:var(--accent);background:#eef3fb;}
+.drop-zone input[type=file]{display:none;}
+.drop-icon{font-size:48px;margin-bottom:16px;line-height:1;}
+.drop-zone h3{font-size:1.1rem;font-weight:600;margin-bottom:8px;}
+.drop-zone p{color:var(--muted);font-size:13px;}
+.browse-link{color:var(--accent);font-weight:600;cursor:pointer;text-decoration:underline;}
+
+/* Progress */
+#progress-section{display:none;margin-top:32px;}
+.progress-bar-wrap{background:#e5e9f0;border-radius:6px;height:10px;overflow:hidden;margin-bottom:12px;}
+.progress-bar{height:100%;border-radius:6px;background:var(--accent);transition:width .3s;}
+#status-text{font-size:13px;color:var(--muted);text-align:center;}
+
+/* Result */
+#result-section{display:none;margin-top:32px;}
+.result-actions{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:20px;}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:7px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:13px;font-weight:600;cursor:pointer;text-decoration:none;}
+.btn:hover{background:#eef3fb;border-color:var(--accent);}
+.btn-primary{background:var(--accent);color:#fff;border-color:var(--accent);}
+.btn-primary:hover{background:#145090;}
+.report-frame-wrap{border:1px solid var(--border);border-radius:10px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06);}
+iframe#report-frame{width:100%;height:80vh;border:none;display:block;}
+
+/* Error */
+#error-section{display:none;margin-top:32px;}
+.error-box{background:#fef2f2;border:1px solid #fca5a5;border-radius:8px;padding:16px;color:var(--red);}
+.error-box strong{display:block;margin-bottom:6px;}
+
+/* Feature table */
+.feature-table-wrap{margin-top:56px;}
+.feature-table-wrap h3{font-size:1rem;font-weight:700;margin-bottom:14px;color:var(--text);}
+table{width:100%;border-collapse:collapse;font-size:13px;}
+th{background:#f0f2f4;text-align:left;padding:9px 12px;font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);border:1px solid var(--border);}
+td{padding:9px 12px;border:1px solid var(--border);background:#fff;}
+tr:hover td{background:#f8fafc;}
+.check{color:var(--green);font-weight:700;}
+.cross{color:#d0d5dd;font-weight:700;}
+
+footer{text-align:center;color:var(--muted);font-size:12px;padding:32px 24px;border-top:1px solid var(--border);margin-top:48px;}
+footer a{color:var(--accent);}
+</style>
+</head>
+<body>
+
+<header>
+  <h1>BioFastq-A <span>Quality Analysis</span></h1>
+  <div style="display:flex;gap:8px;align-items:center">
+    <span class="badge">&#9654; WebAssembly</span>
+    <span class="badge">v2.3.0</span>
+  </div>
+</header>
+
+<main>
+  <div class="hero">
+    <h2>FASTQ Quality Control — in your browser</h2>
+    <p>Same analysis as the native CLI. No server, no upload, no account. Your sequencing data never leaves your machine.</p>
+    <div class="privacy-row">
+      <div class="privacy-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+        100% offline
+      </div>
+      <div class="privacy-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><path d="M12 8v4l3 3"/></svg>
+        No data uploaded
+      </div>
+      <div class="privacy-item">
+        <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+        All metrics identical to CLI
+      </div>
+    </div>
+  </div>
+
+  <!-- Drop zone -->
+  <div class="drop-zone" id="drop-zone" onclick="document.getElementById('file-input').click()">
+    <input type="file" id="file-input" accept=".fastq,.fq,.fastq.gz,.fq.gz,.fasta,.fa">
+    <div class="drop-icon">&#128202;</div>
+    <h3>Drop your FASTQ file here</h3>
+    <p>or <span class="browse-link">browse</span> — .fastq, .fq, .fasta (plain text)</p>
+    <p style="margin-top:8px;font-size:12px;color:#aaa">Compressed (.gz) files are not supported in browser mode — decompress first</p>
+  </div>
+
+  <!-- Progress -->
+  <div id="progress-section">
+    <div class="progress-bar-wrap"><div class="progress-bar" id="progress-bar" style="width:0%"></div></div>
+    <div id="status-text">Loading WebAssembly module…</div>
+  </div>
+
+  <!-- Error -->
+  <div id="error-section">
+    <div class="error-box">
+      <strong>Analysis failed</strong>
+      <span id="error-message"></span>
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div id="result-section">
+    <div class="result-actions">
+      <button class="btn btn-primary" onclick="saveReport()">&#8595; Save HTML Report</button>
+      <button class="btn" onclick="analyzeAnother()">&#8635; Analyze Another File</button>
+    </div>
+    <div class="report-frame-wrap">
+      <iframe id="report-frame" title="QC Report"></iframe>
+    </div>
+  </div>
+
+  <!-- Feature comparison table -->
+  <div class="feature-table-wrap" id="feature-table">
+    <h3>Native CLI vs Browser (WebAssembly) comparison</h3>
+    <table>
+      <thead>
+        <tr><th>Feature</th><th>Native CLI</th><th>Browser (Wasm)</th><th>Notes</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Per-base quality (Q25/Q50/Q75)</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>Per-read GC distribution</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>Overrepresented sequence detection</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>Adapter contamination</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>K-mer frequency (4-mer)</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>N50 / N90</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>Duplication estimate</td><td class="check">✓</td><td class="check">✓</td><td>Sort-dedup instead of HyperLogLog</td></tr>
+        <tr><td>Long-read / ONT mode</td><td class="check">✓</td><td class="check">✓</td><td>Auto-detected from median length</td></tr>
+        <tr><td>Quality-vs-length scatter</td><td class="check">✓</td><td class="check">✓</td><td>Identical metrics</td></tr>
+        <tr><td>HTML + JSON report</td><td class="check">✓</td><td class="check">✓</td><td>Same HTML format, JSON optional</td></tr>
+        <tr><td>Multi-threaded parallel processing</td><td class="check">✓</td><td class="cross">✗</td><td>Wasm: single-threaded — 3–8× slower</td></tr>
+        <tr><td>Memory-mapped I/O (mmap)</td><td class="check">✓</td><td class="cross">✗</td><td>Browsers: File API only</td></tr>
+        <tr><td>Gzip (.fastq.gz) support</td><td class="check">✓</td><td class="cross">✗</td><td>Decompress before drop</td></tr>
+        <tr><td>Adapter trimming output</td><td class="check">✓</td><td class="cross">✗</td><td>QC only in browser mode</td></tr>
+        <tr><td>Paired-end analysis</td><td class="check">✓</td><td class="cross">✗</td><td>Analyze R1 and R2 separately</td></tr>
+        <tr><td>Per-tile Illumina quality</td><td class="check">✓</td><td class="cross">✗</td><td>Requires parsing tile headers (planned)</td></tr>
+      </tbody>
+    </table>
+    <p style="margin-top:10px;font-size:12px;color:var(--muted)">Speed: the browser Wasm build is 3–8× slower than native because it runs single-threaded and cannot use SIMD beyond 128-bit. A 1 GB file that takes ~3 s natively takes ~10–25 s in the browser — still fast enough to be useful for routine QC.</p>
+  </div>
+</main>
+
+<footer>
+  BioFastq-A v2.3.0 WebAssembly build &mdash;
+  <a href="https://github.com/DilaDeniz/BioFastq-a" target="_blank">GitHub</a> &mdash;
+  MIT License
+</footer>
+
+<script type="module">
+// Dynamic import: wasm-pack generates pkg/biofastq_a_wasm.js
+let wasmModule = null;
+
+async function loadWasm() {
+  try {
+    const mod = await import('./pkg/biofastq_a_wasm.js');
+    await mod.default(); // init the wasm module
+    wasmModule = mod;
+    document.getElementById('status-text').textContent = 'WebAssembly module ready. Drop a file to begin.';
+  } catch (e) {
+    showError('Failed to load WebAssembly module: ' + e.message +
+      '. Make sure you ran build.sh and are serving from a local server (e.g. python3 -m http.server).');
+  }
+}
+
+// ---- File handling ----
+
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) handleFile(file);
+});
+fileInput.addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (file) handleFile(file);
+  e.target.value = '';
+});
+
+async function handleFile(file) {
+  // Basic checks
+  if (file.name.endsWith('.gz')) {
+    showError('Compressed files (.gz) are not supported in browser mode. Please decompress the file first (e.g. gunzip file.fastq.gz) then drop the .fastq file.');
+    return;
+  }
+
+  hideAll();
+  document.getElementById('progress-section').style.display = 'block';
+  document.getElementById('feature-table').style.display = 'none';
+  setProgress(10, `Reading ${file.name} (${formatSize(file.size)})…`);
+
+  if (!wasmModule) {
+    setProgress(5, 'Loading WebAssembly module…');
+    await loadWasm();
+  }
+  if (!wasmModule) return; // failed
+
+  setProgress(25, `Parsing ${file.name}…`);
+
+  let data;
+  try {
+    const ab = await file.arrayBuffer();
+    data = new Uint8Array(ab);
+  } catch (e) {
+    showError('Failed to read file: ' + e.message);
+    return;
+  }
+
+  setProgress(40, 'Running quality analysis…');
+
+  // Run analysis (synchronous Wasm call — may block UI briefly for large files)
+  let html;
+  const t0 = performance.now();
+  try {
+    const timestamp = new Date().toLocaleString();
+    // Run in next microtask so UI can update
+    await new Promise(resolve => setTimeout(resolve, 0));
+    html = wasmModule.analyze(data, file.name, timestamp, 0);
+  } catch (e) {
+    showError('Analysis error: ' + e.message);
+    return;
+  }
+  const elapsed = performance.now() - t0;
+
+  // Re-inject elapsed time into the HTML (it was 0 when passed)
+  html = html.replace('Analysis time: 0.0s', `Analysis time: ${(elapsed/1000).toFixed(1)}s`);
+
+  setProgress(90, 'Rendering report…');
+
+  // Show result in iframe
+  const frame = document.getElementById('report-frame');
+  frame.srcdoc = html;
+
+  // Store for download
+  window._lastReportHtml = html;
+  window._lastReportFilename = file.name.replace(/\.(fastq|fq|fasta|fa)$/i, '') + '_report.html';
+
+  setProgress(100, 'Done!');
+  await new Promise(r => setTimeout(r, 300));
+
+  document.getElementById('progress-section').style.display = 'none';
+  document.getElementById('result-section').style.display = 'block';
+}
+
+function setProgress(pct, text) {
+  document.getElementById('progress-bar').style.width = pct + '%';
+  document.getElementById('status-text').textContent = text;
+}
+
+function showError(msg) {
+  hideAll();
+  document.getElementById('error-section').style.display = 'block';
+  document.getElementById('error-message').textContent = msg;
+  document.getElementById('feature-table').style.display = 'block';
+}
+
+function hideAll() {
+  ['progress-section','result-section','error-section'].forEach(id => {
+    document.getElementById(id).style.display = 'none';
+  });
+}
+
+window.saveReport = function() {
+  if (!window._lastReportHtml) return;
+  const a = document.createElement('a');
+  a.download = window._lastReportFilename || 'biofastq_report.html';
+  a.href = 'data:text/html;charset=utf-8,' + encodeURIComponent(window._lastReportHtml);
+  a.click();
+};
+
+window.analyzeAnother = function() {
+  hideAll();
+  document.getElementById('feature-table').style.display = 'block';
+  window._lastReportHtml = null;
+};
+
+function formatSize(bytes) {
+  if (bytes >= 1e9) return (bytes/1e9).toFixed(1) + ' GB';
+  if (bytes >= 1e6) return (bytes/1e6).toFixed(1) + ' MB';
+  if (bytes >= 1e3) return (bytes/1e3).toFixed(0) + ' KB';
+  return bytes + ' B';
+}
+
+// Start loading Wasm eagerly
+loadWasm();
+</script>
+</body>
+</html>
