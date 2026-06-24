@@ -1559,8 +1559,10 @@ fn compute_dup_histogram(sample: &HashMap<u64, u32>) -> Vec<f64> {
 fn parse_illumina_tile(id: &[u8]) -> Option<u32> {
     let s = std::str::from_utf8(id).ok()?;
     let s = s.split_ascii_whitespace().next()?;
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() >= 6 { parts[4].parse().ok() } else { None }
+    let mut fields = s.split(':');
+    let tile = fields.nth(4)?;
+    fields.next()?; // require a 6th field, matching the original parts.len() >= 6 check
+    tile.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
