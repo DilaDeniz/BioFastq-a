@@ -222,26 +222,32 @@ fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
 
     // Per-base sequence quality — worst position average
     // Long-read: ONT Q-scores are lower by design (Q8-Q20 typical)
+    // No quality scores at all (e.g. FASTA input) → omit rather than show a misleading Pass/Fail.
+    let has_quality = f.quality_bases > 0;
     let qual_per_pos = f.avg_qual_per_position();
     let min_pos_q = qual_per_pos.iter().cloned().fold(f64::MAX, f64::min);
-    if lr {
-        m.push(("Per-base quality".into(), if min_pos_q >= 10.0 { QcStatus::Pass }
-            else if min_pos_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
-    } else {
-        m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
-            else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    if has_quality {
+        if lr {
+            m.push(("Per-base quality".into(), if min_pos_q >= 10.0 { QcStatus::Pass }
+                else if min_pos_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        } else {
+            m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
+                else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        }
     }
 
     // Per-sequence quality
     // Long-read mode: use Q10 warn / Q8 fail thresholds; compare mean quality not Q30%
-    if lr {
-        let avg_q = f.avg_quality();
-        m.push(("Per-sequence quality".into(), if avg_q >= 10.0 { QcStatus::Pass }
-            else if avg_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
-    } else {
-        let q30 = f.q30_pct();
-        m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
-            else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    if has_quality {
+        if lr {
+            let avg_q = f.avg_quality();
+            m.push(("Per-sequence quality".into(), if avg_q >= 10.0 { QcStatus::Pass }
+                else if avg_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        } else {
+            let q30 = f.q30_pct();
+            m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
+                else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        }
     }
 
     // Per-base sequence content — check A/T balance and C/G balance
