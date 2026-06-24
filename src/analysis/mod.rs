@@ -1774,20 +1774,26 @@ fn process_paired_files(
                     OwnedRecord { id, seq, qual }
                 }
             };
-            let r2 = match r2_reader.next() {
-                None => break, // R2 ended early — truncated pair
-                Some(Err(e)) => {
-                    state.lock().unwrap().log(LogLevel::Warning, format!("R2 bad record: {}", e));
-                    continue;
-                }
-                Some(Ok(rec)) => {
-                    let id  = rec.id().to_vec();
-                    let seq = rec.normalize(false).to_vec();
-                    let qual = rec.qual().map(|q| q.to_vec());
-                    batch_bytes += seq.len() as u64 + id.len() as u64;
-                    OwnedRecord { id, seq, qual }
+            // Retry R2 alone on a bad record — r1 is already consumed, so re-looping
+            // to the top would re-read a *new* R1 and permanently shift every pair
+            // after this point by one record.
+            let r2 = loop {
+                match r2_reader.next() {
+                    None => break None, // R2 ended early — truncated pair
+                    Some(Err(e)) => {
+                        state.lock().unwrap().log(LogLevel::Warning, format!("R2 bad record: {}", e));
+                        continue;
+                    }
+                    Some(Ok(rec)) => {
+                        let id  = rec.id().to_vec();
+                        let seq = rec.normalize(false).to_vec();
+                        let qual = rec.qual().map(|q| q.to_vec());
+                        batch_bytes += seq.len() as u64 + id.len() as u64;
+                        break Some(OwnedRecord { id, seq, qual });
+                    }
                 }
             };
+            let r2 = match r2 { Some(r) => r, None => break };
             batch.push((r1, r2));
         }
 
