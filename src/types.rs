@@ -72,10 +72,6 @@ impl QcStatus {
     pub fn icon(&self) -> &'static str {
         match self { QcStatus::Pass => "✓", QcStatus::Warn => "!", QcStatus::Fail => "✗" }
     }
-    #[allow(dead_code)]
-    pub fn label(&self) -> &'static str {
-        match self { QcStatus::Pass => "PASS", QcStatus::Warn => "WARN", QcStatus::Fail => "FAIL" }
-    }
 }
 
 /// A single overrepresented sequence found in the sample.
@@ -170,10 +166,6 @@ pub struct ProcessConfig {
     pub flags: FeatureFlags,
     /// Force long-read mode (ONT/PacBio) regardless of auto-detection.
     pub is_long_read: bool,
-    /// Hint that the data is specifically from ONT (vs generic long-read / PacBio).
-    /// Reserved for future ONT-specific processing; currently informational.
-    #[allow(dead_code)]
-    pub is_ont: bool,
     /// When true and trim_output is also true, run a pre-pass collecting raw stats
     /// before trimming so a before/after comparison report can be generated.
     pub compare: bool,
@@ -203,7 +195,6 @@ impl Default for ProcessConfig {
             paired_end_r2: None,
             flags: FeatureFlags::default(),
             is_long_read: false,
-            is_ont: false,
             compare: false,
         }
     }
@@ -481,7 +472,6 @@ impl FileStats {
     }
 
     /// N content per position as percentage.
-    #[allow(dead_code)]
     pub fn n_content_per_position(&self) -> Vec<f64> {
         self.base_composition_pct()
             .iter()
@@ -519,19 +509,6 @@ impl FileStats {
                 [q25 as f64, q50 as f64, q75 as f64]
             })
             .collect()
-    }
-
-    #[allow(dead_code)]
-    /// Average quality per length bin, sorted by bin index.
-    pub fn avg_quality_by_length(&self) -> Vec<(u32, f64)> {
-        let mut v: Vec<(u32, f64)> = self.quality_by_length_bin
-            .iter()
-            .map(|(&bin, &(sum, cnt))| {
-                (bin * 100, if cnt == 0 { 0.0 } else { sum as f64 / cnt as f64 })
-            })
-            .collect();
-        v.sort_by_key(|(bp, _)| *bp);
-        v
     }
 
     /// Top N k-mers by frequency.
