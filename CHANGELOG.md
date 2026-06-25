@@ -4,6 +4,46 @@ All notable changes to BioFastq-A are documented here.
 
 ---
 
+## [2.3.1] — 2026-06-24
+
+### Summary
+
+v2.3.1 is a correctness and stability release. It fixes a long-read accuracy regression and a paired-end pairing bug introduced by v2.3.0's performance work, fixes a packaging issue that could crash already-published Bioconda binaries on some CPUs, ships a WebAssembly build for running BioFastq-A in the browser, and removes the last hardcoded version strings from report/TUI output.
+
+### New Features
+
+#### WebAssembly Browser Build
+BioFastq-A now compiles to a `wasm/` target with the same analysis pipeline as the native CLI — adapter detection, full metrics, HTML report generation — running entirely client-side via a drag-and-drop browser UI. No install, no upload: FASTQ files never leave the browser.
+
+### Performance
+
+| Change | Effect |
+|---|---|
+| zlib-rs backend for flate2 gzip I/O | Faster `.fastq.gz` decompression on the read path |
+| `parse_illumina_tile` iterator rewrite | Removes a per-read `Vec` allocation during per-tile quality tracking |
+
+### Bug Fixes
+
+- **Critical (packaging):** the build was pinned to `target-cpu=native`, baking in the exact CPU instruction set of whatever machine compiled the binary. Bioconda builds once per platform and ships that same binary to everyone, so any user with a CPU that didn't match the build server's feature set got an instant crash (`SIGILL`) on startup with no explanation. The flag served no purpose — BioFastq-A's SIMD (via `memchr`) already does runtime CPU-feature detection — so it's removed with zero performance cost, confirmed via benchmark (554K reads/s on 200K reads before vs. after).
+- **Critical:** N50/N90 were wrong for any read ≥2000bp (long-read/ONT/PacBio data) — v2.3.0's flat-array length histogram collapsed all such reads into one bucket keyed by 2000, corrupting the cumulative-length calculation. Now tracked exactly via an overflow map, with no performance cost for ordinary short-read data.
+- **Major:** paired-end mode (`--compare`/R1+R2) could permanently shift every read pair by one position after a single malformed R2 record, silently cross-pairing the rest of the file. R2 retries are now isolated from the R1 cursor.
+- FASTA input (no quality scores) showed a misleading Pass/Fail for "Per-base quality" and "Per-sequence quality" instead of omitting modules that don't apply.
+- Hardcoded version strings in the HTML report and TUI title bar (`v2.0`) could drift from `Cargo.toml`; both now derive from it at compile time.
+
+### Installation
+```
+# Bioconda
+conda install -c bioconda biofastq-a
+
+# Build from source
+cargo install --path .
+```
+
+Have fun using!
+by Dila Deniz
+
+---
+
 ## [2.3.0] — 2026-05-18
 
 ### Summary
