@@ -49,7 +49,11 @@ pub struct BatchAccum {
     pub adapter_hits: u64,
     pub min_length: u64,
     pub max_length: u64,
-    pub length_histogram: HashMap<u64, u64>,
+    pub length_hist: Vec<u64>,
+    /// Exact length -> count for reads >=2000bp, which would otherwise all
+    /// collapse into length_hist's last bucket. Rare for short-read data (stays
+    /// on the fast array), but needed for N50/N90 accuracy on long-read data.
+    pub length_overflow_hist: HashMap<u64, u64>,
     pub quality_by_pos: Vec<(u64, u64)>,
     /// Per-position Phred histogram — enables Q25/Q50/Q75 per position (FastQC boxplots).
     /// u32 per cell: per-batch max is PARALLEL_BATCH (50K) << u32::MAX. Cast to u64 on merge.
@@ -61,7 +65,7 @@ pub struct BatchAccum {
     pub kmer_table: [u64; 256],
     pub fingerprints: Vec<u64>,
     /// Average quality bucketed by read length (bin = len / 100bp).
-    pub quality_by_length_bin: HashMap<u32, (u64, u64)>,
+    pub quality_by_len_bin: [(u64, u64); 21],
     /// Per-read GC content histogram: index = GC% (0..=100).
     pub gc_per_read: [u64; 101],
     /// Reads discarded by per-read quality/N filters — incremented by caller in mod.rs.
@@ -94,7 +98,8 @@ impl Default for BatchAccum {
             adapter_hits: 0,
             min_length: u64::MAX,
             max_length: 0,
-            length_histogram: HashMap::new(),
+            length_hist: vec![0u64; 2001],
+            length_overflow_hist: HashMap::new(),
             quality_by_pos: vec![(0, 0); MAX_QUAL_POSITION],
             qual_hist_by_pos: vec![[0u32; 43]; MAX_QUAL_POSITION],
             base_composition: vec![[0u64; 5]; MAX_QUAL_POSITION],
@@ -102,7 +107,7 @@ impl Default for BatchAccum {
             per_tile: HashMap::new(),
             kmer_table: [0u64; 256],
             fingerprints: Vec::new(),
-            quality_by_length_bin: HashMap::new(),
+            quality_by_len_bin: [(0u64, 0u64); 21],
             gc_per_read: [0u64; 101],
             reads_filtered: 0,
             ont_channel_counts: HashMap::new(),
@@ -132,7 +137,8 @@ impl BatchAccum {
         if len > 0 {
             if len < self.min_length { self.min_length = len; }
             if len > self.max_length { self.max_length = len; }
-            *self.length_histogram.entry(len).or_insert(0) += 1;
+            self.length_hist[len.min(2000) as usize] += 1;
+            if len >= 2000 { *self.length_overflow_hist.entry(len).or_insert(0) += 1; }
         }
 
         if adapter_hit { self.adapter_hits += 1; }
@@ -207,10 +213,9 @@ impl BatchAccum {
                 self.quality_distribution[bucket.min(42)] += 1;
 
                 // Length-binned quality: bin 0 = 0–99bp, bin 1 = 100–199bp, etc.
-                let bin = (n / 100) as u32;
-                let e = self.quality_by_length_bin.entry(bin).or_insert((0, 0));
-                e.0 += phred_sum;
-                e.1 += n as u64;
+                let bin = (n / 100).min(20);
+                self.quality_by_len_bin[bin].0 += phred_sum;
+                self.quality_by_len_bin[bin].1 += n as u64;
             }
         }
 
@@ -232,9 +237,12 @@ impl BatchAccum {
         self.adapter_hits  += other.adapter_hits;
         if other.min_length < self.min_length { self.min_length = other.min_length; }
         if other.max_length > self.max_length { self.max_length = other.max_length; }
+        for (&k, &v) in &other.length_overflow_hist {
+            *self.length_overflow_hist.entry(k).or_insert(0) += v;
+        }
 
-        for (k, v) in other.length_histogram {
-            *self.length_histogram.entry(k).or_insert(0) += v;
+        for (dst, &src) in self.length_hist.iter_mut().zip(other.length_hist.iter()) {
+            *dst += src;
         }
         // Merge only the positions that were actually written — avoids touching
         // the un-used tail of the 2000-element arrays (critical for short reads).
@@ -258,10 +266,9 @@ impl BatchAccum {
             e.0 += v.0;
             e.1 += v.1;
         }
-        for (k, v) in other.quality_by_length_bin {
-            let e = self.quality_by_length_bin.entry(k).or_insert((0, 0));
-            e.0 += v.0;
-            e.1 += v.1;
+        for (dst, src) in self.quality_by_len_bin.iter_mut().zip(other.quality_by_len_bin.iter()) {
+            dst.0 += src.0;
+            dst.1 += src.1;
         }
         for (dst, &src) in self.gc_per_read.iter_mut().zip(other.gc_per_read.iter()) {
             *dst += src;
@@ -296,13 +303,14 @@ pub fn merge_batch_into_totals(
     adapter_hits:  &mut u64,
     min_length:    &mut u64,
     max_length:    &mut u64,
-    length_histogram:      &mut HashMap<u64, u64>,
+    length_hist:           &mut [u64],
+    length_overflow_hist:  &mut HashMap<u64, u64>,
     quality_by_pos:        &mut [(u64, u64)],
     qual_hist_by_pos:      &mut [[u64; 43]],
     base_composition:      &mut [[u64; 5]],
     quality_distribution:  &mut [u64],
     per_tile:              &mut HashMap<u32, (u64, u64)>,
-    quality_by_length_bin: &mut HashMap<u32, (u64, u64)>,
+    quality_by_len_bin:    &mut [(u64, u64); 21],
 ) {
     *read_count    += acc.read_count;
     *total_bases   += acc.total_bases;
@@ -314,8 +322,11 @@ pub fn merge_batch_into_totals(
     *adapter_hits  += acc.adapter_hits;
     if acc.min_length < *min_length { *min_length = acc.min_length; }
     if acc.max_length > *max_length { *max_length = acc.max_length; }
-    for (&k, &v) in &acc.length_histogram {
-        *length_histogram.entry(k).or_insert(0) += v;
+    for (dst, &src) in length_hist.iter_mut().zip(acc.length_hist.iter()) {
+        *dst += src;
+    }
+    for (&k, &v) in &acc.length_overflow_hist {
+        *length_overflow_hist.entry(k).or_insert(0) += v;
     }
     // Only merge positions that were actually written to — avoids touching zeroed
     // tail data for short reads (e.g., 150bp reads only use positions 0..150).
@@ -338,11 +349,26 @@ pub fn merge_batch_into_totals(
         e.0 += v.0;
         e.1 += v.1;
     }
-    for (&k, &v) in &acc.quality_by_length_bin {
-        let e = quality_by_length_bin.entry(k).or_insert((0, 0));
-        e.0 += v.0;
-        e.1 += v.1;
+    for (dst, src) in quality_by_len_bin.iter_mut().zip(acc.quality_by_len_bin.iter()) {
+        dst.0 += src.0;
+        dst.1 += src.1;
     }
+}
+
+/// Build the length -> count histogram from the flat length_hist array plus the
+/// exact overflow map. Reads >=2000bp are excluded from length_hist's last bucket
+/// (which only tracks their count, not their individual lengths) and instead come
+/// from length_overflow_hist, which keys them by their true length — needed so
+/// N50/N90 stay accurate for long-read data.
+pub fn build_length_histogram(length_hist: &[u64], length_overflow_hist: &HashMap<u64, u64>) -> HashMap<u64, u64> {
+    let mut map: HashMap<u64, u64> = length_hist.iter().enumerate()
+        .filter(|&(i, &v)| v > 0 && i < 2000)
+        .map(|(i, &v)| (i as u64, v))
+        .collect();
+    for (&len, &count) in length_overflow_hist {
+        *map.entry(len).or_insert(0) += count;
+    }
+    map
 }
 
 /// Convert a raw [u64; 256] kmer count table to HashMap<[u8;4], u64>.

@@ -100,8 +100,6 @@ impl MmapFastq {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn len(&self) -> usize { self.mmap.len() }
 }
 
 /// Return the content length, trimming a trailing '\r' if present.
@@ -122,11 +120,4 @@ pub fn count_gc_simd(seq: &[u8]) -> u64 {
         + memchr::memchr_iter(b'C', seq).count()
         + memchr::memchr_iter(b'g', seq).count()
         + memchr::memchr_iter(b'c', seq).count()) as u64
-}
-
-/// Count N bases.
-#[inline]
-#[allow(dead_code)]
-pub fn count_n_simd(seq: &[u8]) -> u64 {
-    memchr::memchr_iter(b'N', seq).count() as u64
 }

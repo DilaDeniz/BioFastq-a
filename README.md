@@ -41,6 +41,50 @@ Real Illumina data — **SRR38033288** (43.5M reads · 6.08 Gbp · ~14 GB · 4 t
 
 ---
 
+## Browser / WebAssembly Version
+
+BioFastq-A runs entirely in the browser via WebAssembly — no installation, no server, no data upload. Drop a FASTQ file on the page and get the same HTML report back in your tab.
+
+```bash
+# Build (requires wasm-pack: cargo install wasm-pack)
+cd wasm && ./build.sh
+
+# Serve locally
+cd wasm/www && python3 -m http.server 8080
+# → open http://localhost:8080
+```
+
+The `wasm/` directory is a self-contained Cargo project. A deployed version can be hosted on any static file server — GitHub Pages, Netlify, S3, Vercel, etc.
+
+### Metrics: identical to the native CLI
+
+Every metric the native binary computes — per-base quality boxplots, GC distribution, adapter detection, k-mer frequency, N50/N90, duplication estimate, overrepresented sequences, long-read scatter — is computed identically in the browser version. The HTML report format is the same file.
+
+### Why it is slower than the native binary
+
+| Constraint | Native | WebAssembly |
+|------------|--------|-------------|
+| Threads | Rayon parallel fold (all cores) | Single-threaded (WASM threads are experimental) |
+| I/O | `memmap2` — OS maps file into address space, zero-copy | File API — browser reads file, copies into WASM heap |
+| SIMD | AVX2 / SSE4 (256-bit vectors) | WebAssembly SIMD (128-bit only) |
+| Allocator | System allocator | `wasm-bindgen` default allocator |
+
+The net result is approximately **3–8× slower** than the native binary. A 200 MB file that takes ~0.7 s natively completes in roughly 5–15 s in the browser. For interactive QC of files you can conveniently open in a browser this is entirely acceptable.
+
+### What the browser version does NOT lose
+
+- All quality metrics — every chart, every statistic is identical to the CLI
+- Offline capability — once loaded the `.wasm` binary is cached; no internet needed
+- Privacy — **your sequencing data never leaves your machine**, not even to GitHub's servers
+
+### Limitations (browser only)
+
+- Compressed (`.gz`) files not supported — decompress first with `gunzip`
+- No adapter trimming output (QC report only)
+- No paired-end mode — analyse R1 and R2 separately
+
+---
+
 ## Installation
 
 ### Bioconda (recommended)
@@ -371,6 +415,8 @@ BioFastq-A is architecturally different from its counterparts in ways that matte
 **Zero-cost new features** — GC distribution, N content, duplication histogram, and quality percentiles are computed from data that was *already being collected*. They add zero meaningful overhead.
 
 **LTO + codegen-units=1** — Link-time optimisation inlines all library code at compile time. The compiler sees the entire program at once and can make global optimisation decisions impossible in separate compilation.
+
+**Flat-array accumulators** — Per-read statistics (`length_histogram`, `quality_by_length_bin`) use flat contiguous arrays instead of HashMaps. Array indexing eliminates hash computation and pointer-chasing on every read. During Rayon's binary-tree reduce, array merges are simple element-wise additions (O(n) memcpy-speed) versus O(n × hash_time) HashMap insertions.
 
 ---
 

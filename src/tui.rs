@@ -84,7 +84,7 @@ fn render_title_bar(frame: &mut ratatui::Frame, area: ratatui::layout::Rect, sna
 
     let title = Line::from(vec![
         Span::styled(
-            " BioFastq-A v2.0 ",
+            format!(" BioFastq-A v{} ", env!("CARGO_PKG_VERSION")),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

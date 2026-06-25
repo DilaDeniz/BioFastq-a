@@ -22,7 +22,7 @@ use crate::types::{
 };
 
 use self::io::{open_writer, write_fastq_record};
-use self::metrics::{fingerprint, kmer_table_to_map, merge_batch_into_totals, BatchAccum};
+use self::metrics::{build_length_histogram, fingerprint, kmer_table_to_map, merge_batch_into_totals, BatchAccum};
 use self::mmap_reader::RecordRange;
 
 // ---------------------------------------------------------------------------
@@ -222,26 +222,32 @@ fn compute_module_status(f: &FileStats) -> Vec<(String, QcStatus)> {
 
     // Per-base sequence quality — worst position average
     // Long-read: ONT Q-scores are lower by design (Q8-Q20 typical)
+    // No quality scores at all (e.g. FASTA input) → omit rather than show a misleading Pass/Fail.
+    let has_quality = f.quality_bases > 0;
     let qual_per_pos = f.avg_qual_per_position();
     let min_pos_q = qual_per_pos.iter().cloned().fold(f64::MAX, f64::min);
-    if lr {
-        m.push(("Per-base quality".into(), if min_pos_q >= 10.0 { QcStatus::Pass }
-            else if min_pos_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
-    } else {
-        m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
-            else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    if has_quality {
+        if lr {
+            m.push(("Per-base quality".into(), if min_pos_q >= 10.0 { QcStatus::Pass }
+                else if min_pos_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        } else {
+            m.push(("Per-base quality".into(), if min_pos_q >= 28.0 { QcStatus::Pass }
+                else if min_pos_q >= 20.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        }
     }
 
     // Per-sequence quality
     // Long-read mode: use Q10 warn / Q8 fail thresholds; compare mean quality not Q30%
-    if lr {
-        let avg_q = f.avg_quality();
-        m.push(("Per-sequence quality".into(), if avg_q >= 10.0 { QcStatus::Pass }
-            else if avg_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
-    } else {
-        let q30 = f.q30_pct();
-        m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
-            else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+    if has_quality {
+        if lr {
+            let avg_q = f.avg_quality();
+            m.push(("Per-sequence quality".into(), if avg_q >= 10.0 { QcStatus::Pass }
+                else if avg_q >= 8.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        } else {
+            let q30 = f.q30_pct();
+            m.push(("Per-sequence quality".into(), if q30 >= 80.0 { QcStatus::Pass }
+                else if q30 >= 60.0 { QcStatus::Warn } else { QcStatus::Fail }));
+        }
     }
 
     // Per-base sequence content — check A/T balance and C/G balance
@@ -431,14 +437,15 @@ fn collect_raw_stats_needletail(
     let mut adapter_hits = 0u64;
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
-    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut length_hist = [0u64; 2001];
+    let mut length_overflow_hist: HashMap<u64, u64> = HashMap::new();
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut quality_by_len_bin = [(0u64, 0u64); 21];
     let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
@@ -507,9 +514,9 @@ fn collect_raw_stats_needletail(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut length_hist, &mut length_overflow_hist, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
-            &mut quality_by_length_bin,
+            &mut quality_by_len_bin,
         );
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
             *dst += src;
@@ -541,7 +548,7 @@ fn collect_raw_stats_needletail(
     raw.min_length            = min_length;
     raw.max_length            = max_length;
     raw.bytes_processed       = file_size;
-    raw.length_histogram      = length_histogram;
+    raw.length_histogram      = build_length_histogram(&length_hist, &length_overflow_hist);
     raw.quality_by_position   = quality_by_pos;
     raw.qual_hist_by_position = qual_hist_by_pos;
     raw.kmer_counts           = kmer_table_to_map(&kmer_table_total);
@@ -549,7 +556,8 @@ fn collect_raw_stats_needletail(
     raw.per_tile_quality      = per_tile;
     raw.base_composition      = base_composition;
     raw.quality_distribution  = quality_distribution;
-    raw.quality_by_length_bin = quality_by_length_bin;
+    raw.quality_by_length_bin = quality_by_len_bin.iter().enumerate()
+        .filter(|(_, t)| t.1 > 0).map(|(i, &t)| (i as u32, t)).collect();
     raw.overrepresented_sequences = overrep_seqs;
     raw.gc_distribution       = gc_distribution.to_vec();
     raw.dup_level_histogram   = compute_dup_histogram(&dup_sample);
@@ -582,14 +590,15 @@ fn collect_raw_stats_mmap(
     let mut adapter_hits = 0u64;
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
-    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut length_hist = [0u64; 2001];
+    let mut length_overflow_hist: HashMap<u64, u64> = HashMap::new();
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut quality_by_len_bin = [(0u64, 0u64); 21];
     let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
     let mut overrep_sampled = 0usize;
@@ -669,9 +678,9 @@ fn collect_raw_stats_mmap(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut length_hist, &mut length_overflow_hist, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
-            &mut quality_by_length_bin,
+            &mut quality_by_len_bin,
         );
         for (dst, &src) in gc_distribution.iter_mut().zip(acc.gc_per_read.iter()) {
             *dst += src;
@@ -705,7 +714,7 @@ fn collect_raw_stats_mmap(
     raw.min_length            = min_length;
     raw.max_length            = max_length;
     raw.bytes_processed       = file_size;
-    raw.length_histogram      = length_histogram;
+    raw.length_histogram      = build_length_histogram(&length_hist, &length_overflow_hist);
     raw.quality_by_position   = quality_by_pos;
     raw.qual_hist_by_position = qual_hist_by_pos;
     raw.kmer_counts           = kmer_table_to_map(&kmer_table_total);
@@ -713,7 +722,8 @@ fn collect_raw_stats_mmap(
     raw.per_tile_quality      = per_tile;
     raw.base_composition      = base_composition;
     raw.quality_distribution  = quality_distribution;
-    raw.quality_by_length_bin = quality_by_length_bin;
+    raw.quality_by_length_bin = quality_by_len_bin.iter().enumerate()
+        .filter(|(_, t)| t.1 > 0).map(|(i, &t)| (i as u32, t)).collect();
     raw.overrepresented_sequences = overrep_seqs;
     raw.gc_distribution       = gc_distribution.to_vec();
     raw.dup_level_histogram   = compute_dup_histogram(&dup_sample);
@@ -818,14 +828,15 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
     let mut bytes = 0u64;
-    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut length_hist = [0u64; 2001];
+    let mut length_overflow_hist: HashMap<u64, u64> = HashMap::new();
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_table_total = [0u64; 256];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut quality_by_len_bin = [(0u64, 0u64); 21];
     // HyperLogLog for global duplicate estimation across ALL reads (1% error, ~2KB memory)
     let mut hll: HyperLogLog = HyperLogLog::new(0.01);
     let mut overrep_map: HashMap<[u8; 50], u64> = HashMap::with_capacity(4096);
@@ -1017,9 +1028,9 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut length_hist, &mut length_overflow_hist, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
-            &mut quality_by_length_bin,
+            &mut quality_by_len_bin,
         );
         reads_filtered += acc.reads_filtered;
 
@@ -1112,7 +1123,7 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = file_size;
-        cur.length_histogram      = length_histogram;
+        cur.length_histogram      = build_length_histogram(&length_hist, &length_overflow_hist);
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
         cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
@@ -1120,7 +1131,8 @@ fn process_single_file(file_path: String, state: Arc<Mutex<SharedState>>, config
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
-        cur.quality_by_length_bin = quality_by_length_bin;
+        cur.quality_by_length_bin = quality_by_len_bin.iter().enumerate()
+            .filter(|(_, t)| t.1 > 0).map(|(i, &t)| (i as u32, t)).collect();
         cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
         cur.gc_distribution = gc_distribution.to_vec();
@@ -1208,12 +1220,13 @@ fn process_single_file_mmap(
     let mut min_length        = u64::MAX;
     let mut max_length        = 0u64;
     let mut bytes             = 0u64;
-    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut length_hist        = [0u64; 2001];
+    let mut length_overflow_hist: HashMap<u64, u64> = HashMap::new();
     let mut quality_by_pos    = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos  = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut base_composition  = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut quality_by_len_bin = [(0u64, 0u64); 21];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_table_total = [0u64; 256];
     let mut hll: HyperLogLog = HyperLogLog::new(0.01);
@@ -1398,9 +1411,9 @@ fn process_single_file_mmap(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut length_hist, &mut length_overflow_hist, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
-            &mut quality_by_length_bin,
+            &mut quality_by_len_bin,
         );
         reads_filtered += acc.reads_filtered;
 
@@ -1488,7 +1501,7 @@ fn process_single_file_mmap(
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = file_size;
-        cur.length_histogram      = length_histogram;
+        cur.length_histogram      = build_length_histogram(&length_hist, &length_overflow_hist);
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
         cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
@@ -1496,7 +1509,8 @@ fn process_single_file_mmap(
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
-        cur.quality_by_length_bin = quality_by_length_bin;
+        cur.quality_by_length_bin = quality_by_len_bin.iter().enumerate()
+            .filter(|(_, t)| t.1 > 0).map(|(i, &t)| (i as u32, t)).collect();
         cur.trimmed_by_adapter    = trimmed_by_adapter;
         cur.overrepresented_sequences = overrep_seqs;
         cur.gc_distribution = gc_distribution.to_vec();
@@ -1545,8 +1559,10 @@ fn compute_dup_histogram(sample: &HashMap<u64, u32>) -> Vec<f64> {
 fn parse_illumina_tile(id: &[u8]) -> Option<u32> {
     let s = std::str::from_utf8(id).ok()?;
     let s = s.split_ascii_whitespace().next()?;
-    let parts: Vec<&str> = s.split(':').collect();
-    if parts.len() >= 6 { parts[4].parse().ok() } else { None }
+    let mut fields = s.split(':');
+    let tile = fields.nth(4)?;
+    fields.next()?; // require a 6th field, matching the original parts.len() >= 6 check
+    tile.parse().ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1721,12 +1737,13 @@ fn process_paired_files(
     let mut min_length = u64::MAX;
     let mut max_length = 0u64;
     let mut bytes = 0u64;
-    let mut length_histogram: HashMap<u64, u64> = HashMap::with_capacity(512);
+    let mut length_hist = [0u64; 2001];
+    let mut length_overflow_hist: HashMap<u64, u64> = HashMap::new();
     let mut quality_by_pos = vec![(0u64, 0u64); crate::types::MAX_QUAL_POSITION];
     let mut qual_hist_by_pos = vec![[0u64; 43]; crate::types::MAX_QUAL_POSITION];
     let mut base_composition = vec![[0u64; 5]; crate::types::MAX_QUAL_POSITION];
     let mut quality_distribution = vec![0u64; PHRED_BUCKETS];
-    let mut quality_by_length_bin: HashMap<u32, (u64, u64)> = HashMap::new();
+    let mut quality_by_len_bin = [(0u64, 0u64); 21];
     let mut per_tile: HashMap<u32, (u64, u64)> = HashMap::new();
     let mut kmer_table_total = [0u64; 256];
     let mut hll_pe: HyperLogLog = HyperLogLog::new(0.01);
@@ -1759,20 +1776,26 @@ fn process_paired_files(
                     OwnedRecord { id, seq, qual }
                 }
             };
-            let r2 = match r2_reader.next() {
-                None => break, // R2 ended early — truncated pair
-                Some(Err(e)) => {
-                    state.lock().unwrap().log(LogLevel::Warning, format!("R2 bad record: {}", e));
-                    continue;
-                }
-                Some(Ok(rec)) => {
-                    let id  = rec.id().to_vec();
-                    let seq = rec.normalize(false).to_vec();
-                    let qual = rec.qual().map(|q| q.to_vec());
-                    batch_bytes += seq.len() as u64 + id.len() as u64;
-                    OwnedRecord { id, seq, qual }
+            // Retry R2 alone on a bad record — r1 is already consumed, so re-looping
+            // to the top would re-read a *new* R1 and permanently shift every pair
+            // after this point by one record.
+            let r2 = loop {
+                match r2_reader.next() {
+                    None => break None, // R2 ended early — truncated pair
+                    Some(Err(e)) => {
+                        state.lock().unwrap().log(LogLevel::Warning, format!("R2 bad record: {}", e));
+                        continue;
+                    }
+                    Some(Ok(rec)) => {
+                        let id  = rec.id().to_vec();
+                        let seq = rec.normalize(false).to_vec();
+                        let qual = rec.qual().map(|q| q.to_vec());
+                        batch_bytes += seq.len() as u64 + id.len() as u64;
+                        break Some(OwnedRecord { id, seq, qual });
+                    }
                 }
             };
+            let r2 = match r2 { Some(r) => r, None => break };
             batch.push((r1, r2));
         }
 
@@ -1831,9 +1854,9 @@ fn process_paired_files(
             &mut read_count, &mut total_bases, &mut gc_count,
             &mut quality_sum, &mut quality_bases, &mut q20_bases, &mut q30_bases,
             &mut adapter_hits, &mut min_length, &mut max_length,
-            &mut length_histogram, &mut quality_by_pos, &mut qual_hist_by_pos,
+            &mut length_hist, &mut length_overflow_hist, &mut quality_by_pos, &mut qual_hist_by_pos,
             &mut base_composition, &mut quality_distribution, &mut per_tile,
-            &mut quality_by_length_bin,
+            &mut quality_by_len_bin,
         );
         reads_filtered += acc.reads_filtered;
 
@@ -1896,7 +1919,7 @@ fn process_paired_files(
         cur.min_length            = min_length;
         cur.max_length            = max_length;
         cur.bytes_processed       = r1_size + r2_size;
-        cur.length_histogram      = length_histogram;
+        cur.length_histogram      = build_length_histogram(&length_hist, &length_overflow_hist);
         cur.quality_by_position   = quality_by_pos;
         cur.qual_hist_by_position = qual_hist_by_pos;
         cur.kmer_counts           = kmer_table_to_map(&kmer_table_total);
@@ -1904,7 +1927,8 @@ fn process_paired_files(
         cur.per_tile_quality      = per_tile;
         cur.base_composition      = base_composition;
         cur.quality_distribution  = quality_distribution;
-        cur.quality_by_length_bin = quality_by_length_bin;
+        cur.quality_by_length_bin = quality_by_len_bin.iter().enumerate()
+            .filter(|(_, t)| t.1 > 0).map(|(i, &t)| (i as u32, t)).collect();
         cur.overrepresented_sequences = overrep_seqs_pe;
         cur.gc_distribution = gc_distribution.to_vec();
         cur.dup_level_histogram = compute_dup_histogram(&dup_sample);
