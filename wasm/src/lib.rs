@@ -231,12 +231,28 @@ fn is_long_read(acc: &BatchAccum) -> bool {
 // Main Wasm entry point
 // ---------------------------------------------------------------------------
 
-/// Analyse a FASTQ/FASTA file provided as raw bytes.
+/// Decompress gzip input (detected via magic bytes `1f 8b`), otherwise pass through unchanged.
+fn decompress_if_gzip(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+        use std::io::Read;
+        let mut out = Vec::new();
+        let _ = flate2::read::GzDecoder::new(data).read_to_end(&mut out);
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(data)
+    }
+}
+
+/// Analyse a FASTQ/FASTA file provided as raw bytes (gzip-compressed or plain).
 /// Returns a complete HTML report as a String.
 /// `timestamp` is a JS-formatted date string (e.g. from `new Date().toLocaleString()`).
 /// `elapsed_ms` is wall-clock time in milliseconds (passed from JS `performance.now()`).
 #[wasm_bindgen]
 pub fn analyze(data: &[u8], filename: &str, timestamp: &str, elapsed_ms: f64) -> String {
+    let compressed_size = data.len() as u64;
+    let decompressed = decompress_if_gzip(data);
+    let data: &[u8] = decompressed.as_ref();
+
     let ac = build_adapter_automaton();
 
     let mut acc = BatchAccum::default();
@@ -247,13 +263,13 @@ pub fn analyze(data: &[u8], filename: &str, timestamp: &str, elapsed_ms: f64) ->
         acc.process(record.seq, record.qual, fp, adapter_hit);
     }
 
-    finalize_to_filestats(acc, filename, data.len() as u64, timestamp, elapsed_ms)
+    finalize_to_filestats(acc, filename, compressed_size, timestamp, elapsed_ms)
 }
 
 /// Version exposed to JavaScript for capability detection.
 #[wasm_bindgen]
 pub fn version() -> String {
-    "2.3.0-wasm".to_string()
+    "2.3.1-wasm".to_string()
 }
 
 // ---------------------------------------------------------------------------

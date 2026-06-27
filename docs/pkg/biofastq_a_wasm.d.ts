@@ -2,7 +2,7 @@
 /* eslint-disable */
 
 /**
- * Analyse a FASTQ/FASTA file provided as raw bytes.
+ * Analyse a FASTQ/FASTA file provided as raw bytes (gzip-compressed or plain).
  * Returns a complete HTML report as a String.
  * `timestamp` is a JS-formatted date string (e.g. from `new Date().toLocaleString()`).
  * `elapsed_ms` is wall-clock time in milliseconds (passed from JS `performance.now()`).
