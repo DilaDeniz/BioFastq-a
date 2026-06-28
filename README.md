@@ -8,7 +8,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
-[![Version](https://img.shields.io/badge/version-2.3.0-blue.svg)](Cargo.toml)
+[![Version](https://img.shields.io/badge/version-2.3.1-blue.svg)](Cargo.toml)
 [![Bioconda](https://img.shields.io/conda/dn/bioconda/biofastq-a.svg?label=Bioconda)](https://anaconda.org/bioconda/biofastq-a)
 
 No Java. No Python. No internet required. Just one binary.
